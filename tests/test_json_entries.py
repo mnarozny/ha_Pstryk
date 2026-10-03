@@ -1,9 +1,9 @@
 """Coordinator -> cache -> JSON sensor, with stand-ins for the Home Assistant helpers.
 
 Home Assistant is not installed here, so the few HA names these modules import
-are replaced by small stubs. The clock is fixed at 2026-10-02 13:00
-Europe/Warsaw, so the fixture (fetched 2026-10-02 12:05 CEST) covers today and
-tomorrow.
+are replaced by small stubs. The clock is set to just after each fixture was
+fetched (Europe/Warsaw): 2026-10-02 13:00 for the one with both days published,
+2026-10-04 02:00 for the one with tomorrow unpublished.
 """
 import asyncio
 import copy
@@ -22,8 +22,11 @@ PKG = ROOT / "custom_components" / "pstryk"
 FIXTURES = Path(__file__).parent / "fixtures"
 TZ = ZoneInfo("Europe/Warsaw")
 NOW = datetime(2026, 10, 2, 13, 0, tzinfo=TZ)
+EARLY_NOW = datetime(2026, 10, 4, 2, 0, tzinfo=TZ)
+CLOCK = [NOW]
 
 REAL = json.loads((FIXTURES / "api_pricing_20261002T120545.json").read_text())
+EARLY = json.loads((FIXTURES / "api_pricing_20261004T013435.json").read_text())
 
 
 def _parse_datetime(value):
@@ -58,8 +61,8 @@ def _stub(name, **attrs):
 def _stubs():
     dt = _stub(
         "homeassistant.util.dt",
-        now=lambda: NOW,
-        utcnow=lambda: NOW.astimezone(timezone.utc),
+        now=lambda: CLOCK[0],
+        utcnow=lambda: CLOCK[0].astimezone(timezone.utc),
         as_utc=lambda d: d.astimezone(timezone.utc),
         as_local=_as_local,
         parse_datetime=_parse_datetime,
@@ -137,20 +140,6 @@ class _FakeAPI:
         return copy.deepcopy(self.response)
 
 
-def _tomorrow_unpublished(response):
-    """Tomorrow's hours before publication: buy gross null, sell gross 0.0 (live
-    caches 2026-10-04), tge null with dist 0.0 and service 0.08 (upstream #28)."""
-    r = copy.deepcopy(response)
-    for frame in r["frames"][24:]:
-        p = frame["metrics"]["pricing"]
-        for k in ("tge_price", "base_price", "vat_component", "full_price", "price_net",
-                  "price_gross", "price_prosumer_net"):
-            p[k] = None
-        p.update(dist_price=0.0, service_price=0.08, price_prosumer_gross=0.0,
-                 is_cheap=False, is_expensive=False)
-    return r
-
-
 def _fetch(mods, tmp_path, response, price_type):
     coordinator = mods.uc.PstrykDataUpdateCoordinator(None, _FakeAPI(response), price_type)
     coordinator._cache_file = str(tmp_path / f"cache_{price_type}.json")
@@ -186,17 +175,33 @@ def test_buy_entry_at_13_local(mods, tmp_path):
     assert sensor.native_value == entry["price"]
 
 
-def test_unpublished_tomorrow(mods, tmp_path):
-    response = _tomorrow_unpublished(REAL)
-    buy, buy_sensor = _fetch(mods, tmp_path, response, "buy")
-    assert len(buy.data["prices"]) == 24
-    assert buy_sensor.extra_state_attributes["prices_tomorrow"] == []
+@pytest.fixture
+def early_clock():
+    CLOCK[0] = EARLY_NOW
+    yield
+    CLOCK[0] = NOW
 
-    sell, sell_sensor = _fetch(mods, tmp_path, response, "sell")
-    tomorrow = [p for p in sell.data["prices"] if p["start"].startswith("2026-10-03")]
+
+def test_unpublished_tomorrow(mods, tmp_path, early_clock):
+    buy, buy_sensor = _fetch(mods, tmp_path, EARLY, "buy")
+    assert len(buy.data["prices"]) == 24
+    buy_attrs = buy_sensor.extra_state_attributes
+    assert len(buy_attrs["prices_today"]) == 24
+    assert buy_attrs["prices_tomorrow"] == []
+    assert all(e["tge_price"] is not None for e in buy_attrs["prices_today"])
+
+    sell, sell_sensor = _fetch(mods, tmp_path, EARLY, "sell")
+    tomorrow = [p for p in sell.data["prices"] if p["start"].startswith("2026-10-05")]
     assert len(tomorrow) == 24
     assert all(p["price"] == 0.0 and p["tge_price"] is None for p in tomorrow)
     assert sell_sensor.extra_state_attributes["prices_tomorrow"] == []
+
+
+def test_sell_entries_have_no_flags(mods, tmp_path):
+    coordinator, sensor = _fetch(mods, tmp_path, REAL, "sell")
+    assert any(p["is_expensive"] for p in coordinator.data["prices"])
+    for entry in sensor.extra_state_attributes["prices"]:
+        assert "is_cheap" not in entry and "is_expensive" not in entry
 
 
 def test_old_cache_entry_gets_none(mods, tmp_path):

@@ -10,7 +10,8 @@ import math
 
 BUY_COMPONENTS = ("tge_price", "dist_price", "service_price", "vat_component", "excise_component")
 SELL_COMPONENTS = ("tge_price",)
-FLAGS = ("is_cheap", "is_expensive")
+# Pstryk sets these per hour for the buy price; sell entries do not get them.
+BUY_FLAGS = ("is_cheap", "is_expensive")
 
 # vat_component is base_price (5 decimals) * 0.23, so the API sends up to 7.
 # Rounding to 7 keeps every digit and drops float noise like 0.6970000000000001.
@@ -22,7 +23,7 @@ def component_keys(price_type):
 
 
 def entry_keys(price_type):
-    return component_keys(price_type) + FLAGS
+    return BUY_COMPONENTS + BUY_FLAGS if price_type == "buy" else SELL_COMPONENTS
 
 
 def _component_value(value):
@@ -40,8 +41,9 @@ def _component_value(value):
 def extract_components(pricing, price_type):
     """Components for one hour, all None while the hour is unpublished.
 
-    Per upstream #28, an unpublished hour has tge_price null but dist_price 0.0 and
-    service_price 0.08, so tge_price decides whether there is data.
+    An unpublished hour has tge_price null but dist_price 0.0, service_price 0.08
+    and excise_component 0.005 (API response 2026-10-04 01:34 CEST), so
+    tge_price decides whether there is data.
     """
     keys = component_keys(price_type)
     if _component_value(pricing.get("tge_price")) is None:

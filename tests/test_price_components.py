@@ -1,7 +1,10 @@
 """Tests for price_components.py, loaded by path so Home Assistant is not needed.
 
-Fixture api_pricing_20261002T120545.json is the Pstryk pricing response for
-2026-10-02 and 2026-10-03 (48 hours), fetched 2026-10-02 at 12:05 CEST.
+Fixtures are Pstryk pricing responses (48 hours from local midnight):
+- api_pricing_20261002T120545.json: 2026-10-02 and 10-03, fetched 2026-10-02
+  12:05 CEST, both days published.
+- api_pricing_20261004T013435.json: 2026-10-04 and 10-05, fetched 2026-10-04
+  01:34 CEST, 10-05 not published yet.
 """
 import importlib.util
 import json
@@ -18,18 +21,16 @@ _spec = importlib.util.spec_from_file_location(
 pc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pc)
 
-FRAMES = json.loads((FIXTURES / "api_pricing_20261002T120545.json").read_text())["frames"]
-PRICINGS = [f["metrics"]["pricing"] for f in FRAMES]
 
-# Shape of an hour that is not published yet, as described in upstream #28:
-# tge_price null, distribution and service already filled in.
-UNPUBLISHED = {
-    "tge_price": None,
-    "dist_price": 0.0,
-    "service_price": 0.08,
-    "is_cheap": False,
-    "is_expensive": False,
-}
+def _pricings(name):
+    frames = json.loads((FIXTURES / name).read_text())["frames"]
+    return [f["metrics"]["pricing"] for f in frames]
+
+
+PRICINGS = _pricings("api_pricing_20261002T120545.json")
+EARLY = _pricings("api_pricing_20261004T013435.json")
+PUBLISHED = PRICINGS + EARLY[:24]
+UNPUBLISHED_HOURS = EARLY[24:]
 
 
 def test_fixture_has_48_published_hours():
@@ -45,10 +46,20 @@ def test_buy_keys():
 
 
 def test_sell_keys():
-    assert pc.entry_keys("sell") == ("tge_price", "is_cheap", "is_expensive")
+    assert pc.entry_keys("sell") == ("tge_price",)
 
 
-@pytest.mark.parametrize("pricing", PRICINGS)
+def test_early_fixture_shape():
+    assert len(EARLY) == 48
+    assert all(p["tge_price"] is not None for p in EARLY[:24])
+    assert all(p["tge_price"] is None for p in UNPUBLISHED_HOURS)
+    # What makes the tge_price check necessary: other fields are already set.
+    assert {p["dist_price"] for p in UNPUBLISHED_HOURS} == {0.0}
+    assert {p["service_price"] for p in UNPUBLISHED_HOURS} == {0.08}
+    assert {p["excise_component"] for p in UNPUBLISHED_HOURS} == {0.005}
+
+
+@pytest.mark.parametrize("pricing", PUBLISHED)
 def test_buy_components_sum_to_gross(pricing):
     c = pc.extract_components(pricing, "buy")
     assert set(c) == set(pc.BUY_COMPONENTS)
@@ -56,7 +67,7 @@ def test_buy_components_sum_to_gross(pricing):
     assert total == pytest.approx(pricing["price_gross"], abs=1e-9)
 
 
-@pytest.mark.parametrize("pricing", PRICINGS)
+@pytest.mark.parametrize("pricing", PUBLISHED)
 def test_sell_tge_gives_prosumer_gross(pricing):
     c = pc.extract_components(pricing, "sell")
     assert set(c) == {"tge_price"}
@@ -78,14 +89,17 @@ def test_seven_decimals_kept():
 
 
 @pytest.mark.parametrize("price_type", ["buy", "sell"])
-def test_unpublished_hour_is_all_none(price_type):
-    c = pc.extract_components(UNPUBLISHED, price_type)
+@pytest.mark.parametrize("pricing", UNPUBLISHED_HOURS)
+def test_unpublished_hour_is_all_none(pricing, price_type):
+    c = pc.extract_components(pricing, price_type)
     assert set(c) == set(pc.component_keys(price_type))
     assert all(v is None for v in c.values())
 
 
 def test_unpublished_hour_does_not_report_free_distribution():
-    assert pc.extract_components(UNPUBLISHED, "buy")["dist_price"] is None
+    c = pc.extract_components(UNPUBLISHED_HOURS[0], "buy")
+    assert c["dist_price"] is None
+    assert c["excise_component"] is None
 
 
 def test_missing_component_is_none():
