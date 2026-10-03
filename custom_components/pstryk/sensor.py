@@ -604,6 +604,8 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
 
 class PstrykJsonPriceSensor(CoordinatorEntity, SensorEntity):
     _attr_icon = "mdi:code-json"
+    # With the price components these lists are ~21 kB, above the recorder's
+    # 16 kB attribute limit; they must stay unrecorded.
     _unrecorded_attributes = frozenset({"prices_today", "prices_tomorrow", "prices"})
 
     def __init__(self, coordinator: PstrykDataUpdateCoordinator, price_type: str, entry_id: str):

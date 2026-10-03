@@ -112,8 +112,14 @@ def test_zero_and_negative_tge_are_published(tge):
     assert c["dist_price"] == 0.1348
 
 
-def test_numeric_string_accepted():
-    assert pc.extract_components({"tge_price": "0.5"}, "sell") == {"tge_price": 0.5}
+@pytest.mark.parametrize("raw", ["0.5", "0,5", " 0.5 "])
+def test_numeric_string_accepted(raw):
+    assert pc.extract_components({"tge_price": raw}, "sell") == {"tge_price": 0.5}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "nan", "-inf"])
+def test_non_finite_counts_as_unpublished(bad):
+    assert pc.extract_components({"tge_price": bad}, "sell") == {"tge_price": None}
 
 
 def test_empty_pricing():

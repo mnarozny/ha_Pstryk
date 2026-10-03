@@ -2,8 +2,11 @@
 
 Buy: tge_price + dist_price + service_price = base_price, and
 base_price + vat_component + excise_component = price_gross.
-Sell: price_prosumer_gross = tge_price * 1.23, so only tge_price applies.
+Sell: price_prosumer_gross = tge_price * 1.23 (seen for positive prices), so only
+tge_price applies.
 """
+
+import math
 
 BUY_COMPONENTS = ("tge_price", "dist_price", "service_price", "vat_component", "excise_component")
 SELL_COMPONENTS = ("tge_price",)
@@ -26,15 +29,18 @@ def _component_value(value):
     if value is None or isinstance(value, bool):
         return None
     try:
-        return round(float(value), COMPONENT_DECIMALS)
+        number = float(str(value).replace(",", ".").strip())
     except (ValueError, TypeError):
         return None
+    if not math.isfinite(number):
+        return None
+    return round(number, COMPONENT_DECIMALS)
 
 
 def extract_components(pricing, price_type):
     """Components for one hour, all None while the hour is unpublished.
 
-    An unpublished hour has tge_price null but dist_price 0.0 and
+    Per upstream #28, an unpublished hour has tge_price null but dist_price 0.0 and
     service_price 0.08, so tge_price decides whether there is data.
     """
     keys = component_keys(price_type)
