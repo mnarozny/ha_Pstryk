@@ -20,6 +20,7 @@ from .const import (
     DEFAULT_RETRY_DELAY
 )
 from homeassistant.loader import async_get_integration
+from .price_components import entry_keys
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -635,6 +636,7 @@ class PstrykJsonPriceSensor(CoordinatorEntity, SensorEntity):
 
     def _price_entries(self):
         data = self.coordinator.data or {}
+        keys = entry_keys(self.price_type)
         entries = []
         for p in data.get("prices", []):
             if p.get("price") is None:
@@ -644,7 +646,7 @@ class PstrykJsonPriceSensor(CoordinatorEntity, SensorEntity):
                 continue
             if t.tzinfo is None:
                 t = t.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
-            entries.append({"time": t, "price": p["price"]})
+            entries.append({"time": t, "price": p["price"], **{k: p.get(k) for k in keys}})
         entries.sort(key=lambda e: e["time"])
         return entries
 

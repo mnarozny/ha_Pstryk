@@ -89,6 +89,19 @@ Integracja korzysta  z nowego endpointu `unified-metrics`
 
 Po włączeniu opcji **"Włącz sensory JSON z cenami"** w ustawieniach integracji pojawiają się sensory `sensor.pstryk_json_buy` i `sensor.pstryk_json_sell` z atrybutami `prices_today`, `prices_tomorrow` i `prices` (48h) w ustandaryzowanym formacie `{time, price}` — zgodnym z TGE/Nordpool i kompatybilnym z [EV Smart Charging](https://github.com/jonasbkarlsson/ev_smart_charging) czy [cheapest-energy-hours](https://github.com/TheFes/cheapest-energy-hours/).
 
+Każdy wpis ma też składniki ceny z API dla danej godziny (zł/kWh, zaokrąglone do 7 miejsc) oraz znaczniki Pstryka:
+
+| Pole | `json_buy` | `json_sell` |
+|---|---|---|
+| `tge_price` — cena energii | ✓ | ✓ |
+| `dist_price` — dystrybucja | ✓ | |
+| `service_price` — opłata serwisowa | ✓ | |
+| `vat_component` — VAT | ✓ | |
+| `excise_component` — akcyza | ✓ | |
+| `is_cheap`, `is_expensive` | ✓ | ✓ |
+
+Dla kupna `tge_price + dist_price + service_price + vat_component + excise_component` to pełna cena brutto (`price` to ta sama cena zaokrąglona do 2 miejsc). Cena sprzedaży to `tge_price × 1,23`, więc pozostałe składniki jej nie dotyczą. Dopóki Pstryk nie opublikuje cen na daną godzinę (`tge_price` = `null`), wszystkie składniki mają wartość `null`, a nie np. `dist_price: 0`.
+
 Przykładowy wykres cen 48h ([apexcharts-card](https://github.com/RomRider/apexcharts-card)):
 
 ```yaml
