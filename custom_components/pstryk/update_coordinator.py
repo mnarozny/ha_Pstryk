@@ -61,6 +61,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self._unsub_midnight = None
         self._unsub_afternoon = None
         self._had_tomorrow_prices = False
+        self.last_price_fetch = None
 
         integration_path = os.path.dirname(os.path.abspath(__file__))
         self._cache_file = os.path.join(integration_path, f"cache_{price_type}.json")
@@ -192,6 +193,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         url = f"{API_URL}{endpoint}"
 
         _LOGGER.debug("Requesting %s data from %s", self.price_type, url)
+        self.last_price_fetch = dt_util.utcnow()
 
         try:
             data = await self.api_client.fetch(
@@ -256,6 +258,20 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.exception("Unexpected error fetching %s data: %s", self.price_type, err)
             raise UpdateFailed(f"Error: {err}") from err
+
+    async def async_fetch_once(self):
+        """One API attempt without retries. On failure the current data stays."""
+        retry_attempts = self.retry_attempts
+        self.retry_attempts = 1
+        try:
+            data = await self._async_update_data()
+        except Exception as err:
+            _LOGGER.warning("One-shot %s price fetch failed, keeping current data: %s", self.price_type, err)
+            return False
+        finally:
+            self.retry_attempts = retry_attempts
+        self.async_set_updated_data(data)
+        return True
 
     def schedule_hourly_update(self):
         if self._unsub_hourly:

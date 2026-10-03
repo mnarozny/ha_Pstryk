@@ -79,7 +79,8 @@
           "mqtt_48h_mode": "Enable 48h mode for MQTT",
           "retry_attempts": "API retry attempts",
           "retry_delay": "API retry delay (seconds)",
-          "json_sensor_enabled": "Enable JSON price sensors"
+          "json_sensor_enabled": "Enable JSON price sensors",
+          "web_signal_experimental": "Experimental: detect tomorrow's prices on pstryk.pl"
         },
         "data_description": {
           "buy_top": "How many cheapest buy prices to highlight (1-24 hours)",
@@ -92,7 +93,8 @@
           "mqtt_48h_mode": "Publish 48 hours of prices (today + tomorrow) instead of just today",
           "retry_attempts": "How many times to retry API requests on failure",
           "retry_delay": "Wait time between API retry attempts",
-          "json_sensor_enabled": "Adds Pstryk Json Buy/Sell sensors with standardized prices_today, prices_tomorrow and prices attributes (compatible with EV Smart Charging, cheapest-energy-hours etc.)"
+          "json_sensor_enabled": "Adds Pstryk Json Buy/Sell sensors with standardized prices_today, prices_tomorrow and prices attributes (compatible with EV Smart Charging, cheapest-energy-hours etc.)",
+          "web_signal_experimental": "From 12:00 to 14:00 checks pstryk.pl every 5 minutes and fetches tomorrow's prices as soon as they appear (one extra API call a day). Falls back to the regular schedule if the page changes"
         }
       },
       "price_settings": {

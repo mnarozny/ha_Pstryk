@@ -69,10 +69,12 @@
         "title": "Opcje Pstryk Energy",
         "description": "Zmodyfikuj konfigurację Pstryk Energy",
         "data": {
-          "json_sensor_enabled": "Włącz sensory JSON z cenami"
+          "json_sensor_enabled": "Włącz sensory JSON z cenami",
+          "web_signal_experimental": "Eksperymentalne: wykrywaj jutrzejsze ceny na pstryk.pl"
         },
         "data_description": {
-          "json_sensor_enabled": "Dodaje sensory Pstryk Json Buy/Sell ze standardowymi atrybutami prices_today, prices_tomorrow i prices (kompatybilne z EV Smart Charging, cheapest-energy-hours itp.)"
+          "json_sensor_enabled": "Dodaje sensory Pstryk Json Buy/Sell ze standardowymi atrybutami prices_today, prices_tomorrow i prices (kompatybilne z EV Smart Charging, cheapest-energy-hours itp.)",
+          "web_signal_experimental": "Od 12:00 do 14:00 co 5 minut sprawdza pstryk.pl i pobiera jutrzejsze ceny, gdy tylko się pojawią (jedno dodatkowe zapytanie do API dziennie). Jeśli strona się zmieni, działa zwykły harmonogram"
         }
       },
       "price_settings": {

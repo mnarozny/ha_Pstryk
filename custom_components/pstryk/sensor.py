@@ -10,10 +10,12 @@ from homeassistant.util import dt as dt_util
 from .update_coordinator import PstrykDataUpdateCoordinator, is_likely_placeholder_data
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
+from .web_watch import PstrykWebSignalWatcher
 from .const import (
     DOMAIN,
     CONF_MQTT_48H_MODE,
     CONF_JSON_SENSOR,
+    CONF_WEB_SIGNAL,
     CONF_RETRY_ATTEMPTS,
     CONF_RETRY_DELAY,
     DEFAULT_RETRY_ATTEMPTS,
@@ -146,6 +148,12 @@ async def async_setup_entry(
         elif coordinator_type == "cost":
             coordinator.schedule_hourly_update()
             coordinator.schedule_midnight_update()
+
+    if entry.options.get(CONF_WEB_SIGNAL, False):
+        watcher = PstrykWebSignalWatcher(hass, entry.entry_id, get_integration_version(hass))
+        hass.data[DOMAIN][f"{entry.entry_id}_web_watch"] = watcher
+        watcher.start()
+        _LOGGER.info("Experimental pstryk.pl check for tomorrow's prices enabled")
 
     remaining_entities = []
 

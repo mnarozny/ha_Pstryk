@@ -19,6 +19,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = ["sensor", "button"]
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data.setdefault(DOMAIN, {})
     return True
@@ -29,7 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not entry.update_listeners:
         entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _LOGGER.debug("Pstryk entry setup: %s", entry.entry_id)
     
     mqtt_enabled = entry.options.get(CONF_MQTT_ENABLED, False)
@@ -123,6 +125,10 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
         mqtt_publisher.unsubscribe()
         hass.data[DOMAIN].pop(f"{entry.entry_id}_mqtt", None)
     
+    web_watch = hass.data[DOMAIN].pop(f"{entry.entry_id}_web_watch", None)
+    if web_watch:
+        web_watch.stop()
+
     for price_type in ("buy", "sell"):
         key = f"{entry.entry_id}_{price_type}"
         coordinator = hass.data[DOMAIN].get(key)
@@ -161,7 +167,7 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _cleanup_coordinators(hass, entry)
     
-    unload_ok = await hass.config_entries.async_forward_entry_unload(entry, "sensor")
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     
     if unload_ok:
         if entry.entry_id in hass.data[DOMAIN]:

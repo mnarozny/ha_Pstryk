@@ -17,6 +17,7 @@ from .const import (
     CONF_MQTT_TOPIC_SELL,
     CONF_MQTT_48H_MODE,
     CONF_JSON_SENSOR,
+    CONF_WEB_SIGNAL,
     CONF_RETRY_ATTEMPTS,
     CONF_RETRY_DELAY,
     DEFAULT_RETRY_ATTEMPTS,
@@ -205,6 +206,8 @@ class PstrykOptionsFlowHandler(config_entries.OptionsFlow):
                     vol.All(vol.Coerce(int), vol.Range(min=1, max=24)),
             vol.Required(CONF_JSON_SENSOR, default=self.config_entry.options.get(
                 CONF_JSON_SENSOR, False)): bool,
+            vol.Optional(CONF_WEB_SIGNAL, default=self.config_entry.options.get(
+                CONF_WEB_SIGNAL, False)): bool,
         }
 
         if mqtt_enabled:
