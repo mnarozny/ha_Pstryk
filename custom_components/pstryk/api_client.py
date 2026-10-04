@@ -17,15 +17,17 @@ from .const import (
     API_URL,
     API_HOURLY_LIMIT,
     API_SLOT_WAIT_SECONDS,
+    API_WINDOW_MARGIN_SECONDS,
     DOMAIN,
     PRICING_ENDPOINT,
     REQUEST_LOG_STORE_VERSION,
 )
-from .request_budget import RequestBudget
+from .request_budget import WINDOW, RequestBudget
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_RETRY_AFTER_SECONDS = 3600
+BUDGET_WINDOW = WINDOW + timedelta(seconds=API_WINDOW_MARGIN_SECONDS)
 
 
 async def _sleep(seconds: float) -> None:
@@ -46,17 +48,26 @@ def retry_after_seconds(headers, now: datetime) -> float:
     return DEFAULT_RETRY_AFTER_SECONDS
 
 
-async def async_claim_slot(budget: RequestBudget, keep_free: int = 0) -> bool:
-    """Record a request if the budget has room, or will have within API_SLOT_WAIT_SECONDS."""
+async def async_claim_slot(budget: RequestBudget, keep_free: int = 0, still_wanted=None) -> datetime | None:
+    """Record a request if the budget has room, or will have within API_SLOT_WAIT_SECONDS.
+
+    Returns the recorded time, to be moved to the send time with `restamp`, or
+    None if there is no room. `still_wanted` (optional) is called after a wait
+    and raises if the caller was retired meanwhile.
+    """
     now = dt_util.utcnow()
-    if budget.claim(now, keep_free):
-        return True
-    free_at = budget.free_at(now, keep_free)
-    wait = (free_at - now).total_seconds() if free_at else None
-    if wait is None or wait > API_SLOT_WAIT_SECONDS:
-        return False
-    await _sleep(wait + 0.05)
-    return budget.claim(dt_util.utcnow(), keep_free)
+    if not budget.claim(now, keep_free):
+        free_at = budget.free_at(now, keep_free)
+        wait = (free_at - now).total_seconds() if free_at else None
+        if wait is None or wait > API_SLOT_WAIT_SECONDS:
+            return None
+        await _sleep(wait + 0.05)
+        if still_wanted is not None:
+            still_wanted()
+        now = dt_util.utcnow()
+        if not budget.claim(now, keep_free):
+            return None
+    return now
 
 
 class BudgetExhausted(UpdateFailed):
@@ -69,6 +80,10 @@ class BudgetExhausted(UpdateFailed):
             f"API budget for {endpoint_key} is full ({API_HOURLY_LIMIT}/h); "
             f"next slot at {dt_util.as_local(free_at).strftime('%H:%M:%S') if free_at else 'unknown'}"
         )
+
+
+class ClientClosed(UpdateFailed):
+    """No request was sent: the entry this client belonged to was unloaded or reloaded."""
 
 
 class SharedRequestLog:
@@ -91,7 +106,7 @@ class SharedRequestLog:
                 return
             data = await self._store.async_load() or {}
             for endpoint_key, value in data.items():
-                self._budgets[endpoint_key] = RequestBudget.from_dict(value, API_HOURLY_LIMIT)
+                self._budgets[endpoint_key] = RequestBudget.from_dict(value, API_HOURLY_LIMIT, BUDGET_WINDOW)
             self._loaded = True
             _LOGGER.debug("Loaded API request log: %s", {
                 key: budget.used(dt_util.utcnow()) for key, budget in self._budgets.items()
@@ -99,7 +114,7 @@ class SharedRequestLog:
 
     def budget(self, endpoint_key: str) -> RequestBudget:
         if endpoint_key not in self._budgets:
-            self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT)
+            self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT, BUDGET_WINDOW)
         return self._budgets[endpoint_key]
 
     async def async_save(self) -> None:
@@ -131,12 +146,14 @@ async def async_validate_api_key(hass: HomeAssistant, api_key: str) -> bool | No
     )
     request_log = await async_get_request_log(hass)
     budget = request_log.budget("unified-metrics")
-    if not await async_claim_slot(budget):
+    claimed = await async_claim_slot(budget)
+    if claimed is None:
         return None
     await request_log.async_save()
     try:
         session = async_get_clientsession(hass)
         async with asyncio.timeout(API_TIMEOUT):
+            budget.restamp(claimed, dt_util.utcnow())
             resp = await session.get(url, headers={"Authorization": api_key, "Accept": "application/json"})
     except (Exception, asyncio.TimeoutError):
         return False
@@ -166,6 +183,16 @@ class PstrykAPIClient:
 
         self._in_flight: Dict[str, asyncio.Task] = {}
         self._in_flight_lock = asyncio.Lock()
+
+        self.closed = False
+
+    def close(self) -> None:
+        """The entry is unloading: work still waiting (a slot, a retry) sends nothing more."""
+        self.closed = True
+
+    def _check_open(self) -> None:
+        if self.closed:
+            raise ClientClosed("Pstryk entry was unloaded; request not sent")
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -264,14 +291,19 @@ class PstrykAPIClient:
         last_exception = None
 
         for attempt in range(max_retries):
+            self._check_open()
             budget = self._budget(endpoint_key)
-            if not await async_claim_slot(budget, keep_free):
+            claimed = await async_claim_slot(budget, keep_free, self._check_open)
+            if claimed is None:
                 raise BudgetExhausted(endpoint_key, budget.free_at(dt_util.utcnow(), keep_free))
+            # Saved before sending, so a crash cannot lose it. The saved time is
+            # the claim; the send time below reaches the file with the next save.
             await self._save_budget()
 
             try:
                 async with self._request_semaphore:
                     async with asyncio.timeout(API_TIMEOUT):
+                        budget.restamp(claimed, dt_util.utcnow())
                         async with self.session.get(url, headers=headers) as response:
                             if response.status == 200:
                                 data = await response.json()

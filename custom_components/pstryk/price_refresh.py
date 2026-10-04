@@ -54,6 +54,8 @@ async def async_refresh_prices(hass, entry_id, reason: str, is_current=None) -> 
         # in-flight dedup turns them into a single HTTP request.
         results = await asyncio.gather(*(c.async_fetch_once() for c in coordinators))
 
+    if "stopped" in results:
+        return "stopped"
     if "budget" in results:
         free_at = budget_free_at(hass, entry_id)
         _LOGGER.info(

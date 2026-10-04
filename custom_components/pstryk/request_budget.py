@@ -41,6 +41,12 @@ class RequestBudget:
         self._times.append(now)
         return True
 
+    def restamp(self, claimed: datetime, sent: datetime) -> datetime:
+        """Move a claimed request to the time it is sent, so its slot frees an hour after that."""
+        if claimed in self._times:
+            self._times[self._times.index(claimed)] = sent
+        return sent
+
     def free_at(self, now: datetime, keep_free: int = 0) -> datetime | None:
         """When `has_room(..., keep_free)` becomes true; None if it already is."""
         if self.has_room(now, keep_free):

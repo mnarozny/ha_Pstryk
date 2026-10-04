@@ -74,3 +74,16 @@ def test_persistence_round_trip_drops_old_entries():
 def test_damaged_log_counts_from_empty():
     restored = RequestBudget.from_dict({"times": ["not a time"]}, 3)
     assert restored.used(_utc(10, 0)) == 0
+
+
+def test_restamp_moves_one_request_to_its_send_time():
+    T0 = _utc(10, 5)
+    budget = RequestBudget(3)
+    claimed = T0
+    for _ in range(2):
+        assert budget.claim(claimed)
+    sent = budget.restamp(claimed, T0 + timedelta(milliseconds=200))
+    assert sent == T0 + timedelta(milliseconds=200)
+    assert budget.to_dict(T0 + timedelta(seconds=1))["times"] == [T0.isoformat(), sent.isoformat()]
+    assert budget.restamp(T0 - timedelta(hours=5), T0) == T0  # unknown stamp: nothing to move
+    assert budget.used(T0 + timedelta(seconds=1)) == 2

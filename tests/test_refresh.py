@@ -33,6 +33,7 @@ CACHE = {}  # the integration's cache files, by price type
 STORE_DISK = {}  # survives "restarts": one dict per store key
 SCHEDULED = []  # (when_utc, callback) from async_track_point_in_time
 NOTIFICATIONS = {}
+SAVE_DELAYS_MS = []  # how long each request-log save takes on the fake clock; then 0
 
 
 def _set_clock(*args):
@@ -79,6 +80,8 @@ class _Store:
 
     async def async_save(self, data):
         STORE_DISK[self.key] = copy.deepcopy(data)
+        if SAVE_DELAYS_MS:
+            CLOCK[0] += timedelta(milliseconds=SAVE_DELAYS_MS.pop(0))
 
 
 def _track(hass, callback, when):
@@ -233,21 +236,27 @@ class _Hass:
 
 
 @pytest.fixture
-def env(mods):
+def env(mods, monkeypatch):
     STORE_DISK.clear()
     SCHEDULED.clear()
     NOTIFICATIONS.clear()
     CACHE.clear()
+    SAVE_DELAYS_MS.clear()
     _set_clock(2026, 10, 2, 12, 5)
     hass = _Hass()
 
-    async def build():
+    async def _sleep(seconds):  # waiting for a slot moves the fake clock
+        CLOCK[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(mods.api, "_sleep", _sleep)
+
+    async def build(entry_id="e"):
         client = mods.api.PstrykAPIClient(hass, "key")
         await client.async_load_budget()
         client._calculate_backoff = lambda attempt, base_delay=20.0: 0
         coords = {}
         for price_type in ("buy", "sell"):
-            coord = mods.uc.PstrykDataUpdateCoordinator(hass, client, price_type, False, 5, 30, "e")
+            coord = mods.uc.PstrykDataUpdateCoordinator(hass, client, price_type, False, 5, 30, entry_id)
 
             async def _cache_write(data, price_type=price_type):
                 CACHE[price_type] = copy.deepcopy(data)
@@ -257,7 +266,7 @@ def env(mods):
 
             coord._save_cache = _cache_write
             coord._load_cache = _cache_read
-            hass.data["pstryk"][f"e_{price_type}"] = coord
+            hass.data["pstryk"][f"{entry_id}_{price_type}"] = coord
             coords[price_type] = coord
         return client, coords
 
@@ -352,7 +361,8 @@ def test_retries_count_and_stop_at_the_budget(mods, env):
     assert buy.data["prices"] == kept  # current data kept
     assert buy.last_update_success is True
     assert buy._unsub_budget_retry is not None  # a fetch is booked for when a slot frees
-    assert SCHEDULED[-1][0] == datetime(2026, 10, 2, 13, 5, 5, tzinfo=TZ).astimezone(timezone.utc)
+    # 12:05:00 + the hour + 2 s margin, then 5 s more
+    assert SCHEDULED[-1][0] == datetime(2026, 10, 2, 13, 5, 7, tzinfo=TZ).astimezone(timezone.utc)
 
 
 def test_cost_runs_only_on_leftover_budget(mods, env):
@@ -602,15 +612,6 @@ def _at(day, hour, minute, second=0, ms=0):
     CLOCK[0] = datetime(2026, 10, day, hour, minute, second, ms * 1000, tzinfo=TZ)
 
 
-@pytest.fixture
-def ticking(mods, monkeypatch):
-    """Waiting for a slot moves the fake clock."""
-    async def _sleep(seconds):
-        CLOCK[0] += timedelta(seconds=seconds)
-
-    monkeypatch.setattr(mods.api, "_sleep", _sleep)
-
-
 def _slow(session, ms=400):
     """Every request takes `ms` on the fake clock."""
     get = session.get
@@ -623,9 +624,10 @@ def _slow(session, ms=400):
     session.get = slow_get
 
 
-def test_review3_checks_an_hour_apart_wait_for_the_slot(mods, env, ticking):
+def test_review3_checks_an_hour_apart_wait_for_the_slot(mods, env):
     # Timers fire a few ms off; a check may come just before last hour's request leaves the window.
-    times = [(12, 10, 50), (12, 30, 40), (12, 50, 30), (13, 10, 20), (13, 30, 10), (13, 50, 45), (14, 10, 15), (14, 30, 5)]
+    # The whole late day, 12:10 to 23:50, with the timer 5-50 ms late.
+    times = [(h, m, 50 - (7 * (3 * h + m // 20)) % 46) for h in range(12, 24) for m in (10, 30, 50)]
 
     async def scenario():
         env.hass.session.pricing = EARLY  # Oct 5 stays unpublished
@@ -643,7 +645,7 @@ def test_review3_checks_an_hour_apart_wait_for_the_slot(mods, env, ticking):
     assert env.hass.session.max_in_any_hour() == 3
 
 
-def test_review3_cost_runs_every_hour(mods, env, ticking):
+def test_review3_cost_runs_every_hour(mods, env):
     async def scenario():
         client, coords = await env.build()
         await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # 12:05, tomorrow cached
@@ -652,7 +654,8 @@ def test_review3_cost_runs_every_hour(mods, env, ticking):
         cost.schedule_hourly_update = lambda: None
         _slow(env.hass.session)
         runs = []
-        for hour, ms in [(13, 10), (14, 4), (15, 20), (16, 30), (17, 12)]:
+        # 13:50 to 22:50. Each run starts when the last one's slots free, about 2 s later every hour.
+        for hour, ms in [(h, 30 - (11 * h) % 27) for h in range(13, 23)]:
             _at(2, hour, 50, 0, ms)
             before = len(env.hass.session.sent)
             cost.data = None
@@ -660,16 +663,16 @@ def test_review3_cost_runs_every_hour(mods, env, ticking):
             runs.append((len(env.hass.session.sent) - before, sorted(cost.data or {})))
         return runs
 
-    assert _run(scenario()) == [(2, ["daily", "monthly", "yearly"])] * 5
+    assert _run(scenario()) == [(2, ["daily", "monthly", "yearly"])] * 10
     assert env.hass.session.max_in_any_hour() <= 3
 
 
-def test_a_slot_further_away_is_not_waited_for(mods, env, ticking):
+def test_a_slot_further_away_is_not_waited_for(mods, env):
     async def scenario():
         client, coords = await env.build()
         await _two_more_calls(client)
         await coords["buy"].async_request_refresh()  # 12:05: the third
-        _at(2, 13, 4, 30)  # the slot frees in 30 s
+        _at(2, 13, 4, 0)  # the slot frees in a minute
         return await mods.refresh.async_refresh_prices(env.hass, "e", "test")
 
     assert _run(scenario()) == "budget"
@@ -811,3 +814,108 @@ def test_review3_button_reports_a_failed_refresh(mods, env):
     failed = _run(scenario())
     assert "pstryk_refresh_failed" in failed
     assert NOTIFICATIONS == {}  # a good press clears it
+
+
+# Fourth review (Codex on 3a9acb9).
+
+
+def test_review4_a_slot_frees_an_hour_after_the_request_was_sent(mods, env):
+    # The log save sits between claiming a slot and sending; it took 200 ms for the first request.
+    async def scenario():
+        env.hass.session.pricing = EARLY
+        _at(4, 12, 9)
+        client, coords = await env.build()
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        SAVE_DELAYS_MS.extend([200, 10, 10, 10])
+        for hour, minute in [(12, 10), (12, 30), (12, 50), (13, 10)]:
+            _at(4, hour, minute, 0, 100)
+            await poller.async_check()
+
+    _run(scenario())
+    sent = env.hass.session.sent
+    assert len(sent) == 4
+    assert sent[0] == datetime(2026, 10, 4, 12, 10, 0, 300000, tzinfo=TZ)
+    assert sent[3] - sent[0] >= timedelta(hours=1, seconds=2)
+    assert env.hass.session.max_in_any_hour() == 3
+
+
+def test_review4_unload_during_a_slot_wait_sends_nothing(mods, env, monkeypatch):
+    async def scenario():
+        env.hass.session.pricing = EARLY
+        _at(4, 12, 9)
+        client, coords = await env.build()
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        for hour, minute in [(12, 10), (12, 30), (12, 50)]:
+            _at(4, hour, minute, 0, 100)
+            await poller.async_check()
+
+        async def unload_while_waiting(seconds):
+            CLOCK[0] += timedelta(seconds=seconds)
+            client.close()  # what _cleanup_coordinators does
+
+        monkeypatch.setattr(mods.api, "_sleep", unload_while_waiting)
+        _at(4, 13, 10, 0, 50)
+        return await poller.async_check(), _used(env)
+
+    result, used = _run(scenario())
+    assert result == "stopped"
+    assert len(env.hass.session.sent) == 3
+    assert used == 2  # no slot taken for it either (12:10 has left the window)
+
+
+def test_review4_retired_coordinator_neither_fetches_nor_books_a_retry(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        await _two_more_calls(client)
+        await coords["buy"].async_request_refresh()  # budget full
+        SCHEDULED.clear()
+        client.close()
+        await coords["buy"].async_request_refresh()
+        coords["buy"]._arm_budget_retry(None)
+        _set_clock(2026, 10, 2, 14, 0)
+        return await coords["buy"].async_fetch_once()
+
+    assert _run(scenario()) == "stopped"
+    assert SCHEDULED == []
+    assert len(env.hass.session.sent) == 3
+    assert CACHE["buy"]["owner"] == "e"
+
+
+def test_review4_another_entrys_cache_is_not_trusted(mods, env):
+    async def scenario():
+        _at(2, 13, 0)
+        client, coords = await env.build("old")
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))
+        env.hass.data["pstryk"].clear()  # entry deleted; its cache files stay
+        _at(2, 15, 0)
+        client, coords = await env.build("new")
+        loaded = await coords["buy"].async_load_startup_cache()
+        exposed = coords["buy"].data
+        await asyncio.gather(*(c.async_startup() for c in coords.values()))
+        return loaded, exposed, coords["buy"]
+
+    loaded, exposed, buy = _run(scenario())
+    assert loaded is False and exposed is None
+    assert len(env.hass.session.sent) == 2  # the new entry fetched its own prices
+    assert CACHE["buy"]["owner"] == "new"
+    assert buy.last_update_success is True
+
+
+def test_review4_a_cache_without_an_owner_is_not_trusted(mods, env):
+    async def scenario():
+        _at(2, 13, 0)
+        client, coords = await env.build()
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))
+        for cached in CACHE.values():
+            del cached["owner"]  # written by an older version
+        env.hass.data["pstryk"].clear()
+        _at(2, 15, 0)
+        client, coords = await env.build()
+        sell = coords["sell"]
+        sell.schedule_hourly_update = lambda: None
+        loaded = await sell.async_load_startup_cache()
+        await sell._handle_hourly_update(None)  # no data: the tick must not take the file either
+        return loaded
+
+    assert _run(scenario()) is False
+    assert len(env.hass.session.sent) == 2

@@ -15,7 +15,7 @@ from .const import (
     DEFAULT_RETRY_ATTEMPTS,
     DEFAULT_RETRY_DELAY
 )
-from .api_client import PstrykAPIClient, BudgetExhausted
+from .api_client import PstrykAPIClient, BudgetExhausted, ClientClosed
 from .price_policy import today_published, tomorrow_fetch_due
 from .price_components import extract_components
 
@@ -124,6 +124,19 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
         await asyncio.to_thread(_write)
 
+    async def _load_own_cache(self) -> dict[str, Any] | None:
+        """The cache, if this config entry wrote it.
+
+        The files are named by price type only and outlive their entry; an
+        entry added later may belong to another meter with another tariff. A
+        cache without an owner (older versions) is not used either.
+        """
+        cached = await self._load_cache()
+        if cached and self.entry_id and cached.get("owner") != self.entry_id:
+            _LOGGER.info("Cache for %s was written by another entry; not using it", self.price_type)
+            return None
+        return cached
+
     def _check_has_valid_tomorrow(self, data: dict) -> bool:
         now = dt_util.now()
         tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -214,7 +227,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         fetch (no usable cache, or tomorrow's prices are due and missing).
         Unusable cached rows are not exposed: data stays None until a fetch.
         """
-        cached = await self._load_cache()
+        cached = await self._load_own_cache()
         if not self.today_usable(cached):
             return False
         self.data = {**self._for_today(cached), "is_cached": True}
@@ -242,6 +255,9 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
     def _arm_budget_retry(self, free_at):
         if self._unsub_budget_retry:
             self._unsub_budget_retry()
+            self._unsub_budget_retry = None
+        if self.api_client.closed:
+            return
         retry_at = (free_at or dt_util.utcnow() + timedelta(minutes=5)) + timedelta(seconds=5)
         _LOGGER.info("Retrying %s price fetch at %s", self.price_type,
                      dt_util.as_local(retry_at).strftime("%H:%M:%S"))
@@ -314,6 +330,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 "prices_today": prices_today,
                 "prices": prices,
                 "is_cached": False,
+                "owner": self.entry_id,
                 # When these prices were fetched; kept in the cache across restarts.
                 "last_updated": dt_util.now().isoformat(),
             }
@@ -328,7 +345,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
             return new_data
 
-        except BudgetExhausted:
+        except (BudgetExhausted, ClientClosed):
             raise
 
         except UpdateFailed as err:
@@ -340,9 +357,11 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Error: {err}") from err
 
     async def async_fetch_once(self) -> str:
-        """One API attempt without retries: "ok", "budget" or "failed". On failure the current data stays."""
+        """One API attempt without retries: "ok", "budget", "stopped" or "failed". On failure the current data stays."""
         try:
             data = await self._fetch_prices(max_retries=1)
+        except ClientClosed:
+            return "stopped"
         except BudgetExhausted as err:
             _LOGGER.info("One-shot %s price fetch not sent: %s", self.price_type, err)
             return "budget"
@@ -384,7 +403,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
         _LOGGER.debug("Hourly update for %s - loading from cache", self.price_type)
 
-        cached_data = self.data or await self._load_cache()
+        cached_data = self.data or await self._load_own_cache()
 
         if cached_data:
             last_updated = cached_data.get("last_updated", "")

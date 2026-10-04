@@ -125,6 +125,12 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
         mqtt_publisher.unsubscribe()
         hass.data[DOMAIN].pop(f"{entry.entry_id}_mqtt", None)
     
+    # First, so that work still waiting for a slot or a retry sends nothing
+    # and books no new timer after the ones below are cancelled.
+    api_client = hass.data[DOMAIN].get(f"{entry.entry_id}_api_client")
+    if api_client:
+        api_client.close()
+
     tomorrow_poll = hass.data[DOMAIN].pop(f"{entry.entry_id}_tomorrow_poll", None)
     if tomorrow_poll:
         tomorrow_poll.stop()
