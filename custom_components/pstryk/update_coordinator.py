@@ -4,6 +4,7 @@ import os
 from datetime import timedelta
 import asyncio
 from typing import Any
+from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.util import dt as dt_util
@@ -14,7 +15,7 @@ from .const import (
     DEFAULT_RETRY_ATTEMPTS,
     DEFAULT_RETRY_DELAY
 )
-from .api_client import PstrykAPIClient
+from .api_client import PstrykAPIClient, BudgetExhausted
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self._unsub_midnight = None
         self._unsub_afternoon = None
         self._had_tomorrow_prices = False
-        self.last_price_fetch = None
+        self._unsub_budget_retry = None
 
         integration_path = os.path.dirname(os.path.abspath(__file__))
         self._cache_file = os.path.join(integration_path, f"cache_{price_type}.json")
@@ -178,6 +179,31 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self._had_tomorrow_prices = has_valid_tomorrow_prices
 
     async def _async_update_data(self):
+        try:
+            return await self._fetch_prices(self.retry_attempts)
+        except BudgetExhausted as err:
+            # Prices come first: keep what we have and fetch as soon as a slot frees.
+            self._arm_budget_retry(err.free_at)
+            if self.data:
+                _LOGGER.info("%s prices: %s; keeping current data", self.price_type, err)
+                return self.data
+            raise
+
+    @callback
+    def _arm_budget_retry(self, free_at):
+        if self._unsub_budget_retry:
+            self._unsub_budget_retry()
+        retry_at = (free_at or dt_util.utcnow() + timedelta(minutes=5)) + timedelta(seconds=5)
+        _LOGGER.info("Retrying %s price fetch at %s", self.price_type,
+                     dt_util.as_local(retry_at).strftime("%H:%M:%S"))
+
+        async def _retry(_):
+            self._unsub_budget_retry = None
+            await self.async_request_refresh()
+
+        self._unsub_budget_retry = async_track_point_in_time(self.hass, _retry, retry_at)
+
+    async def _fetch_prices(self, max_retries):
         _LOGGER.debug("Starting %s price update (48h mode: %s)", self.price_type, self.mqtt_48h_mode)
 
         today_local = dt_util.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -193,12 +219,11 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         url = f"{API_URL}{endpoint}"
 
         _LOGGER.debug("Requesting %s data from %s", self.price_type, url)
-        self.last_price_fetch = dt_util.utcnow()
 
         try:
             data = await self.api_client.fetch(
                 url,
-                max_retries=self.retry_attempts,
+                max_retries=max_retries,
                 base_delay=self.retry_delay
             )
 
@@ -251,6 +276,9 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
             return new_data
 
+        except BudgetExhausted:
+            raise
+
         except UpdateFailed as err:
             _LOGGER.error("Failed to fetch %s data from API: %s", self.price_type, err)
             raise
@@ -259,19 +287,18 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.exception("Unexpected error fetching %s data: %s", self.price_type, err)
             raise UpdateFailed(f"Error: {err}") from err
 
-    async def async_fetch_once(self):
-        """One API attempt without retries. On failure the current data stays."""
-        retry_attempts = self.retry_attempts
-        self.retry_attempts = 1
+    async def async_fetch_once(self) -> str:
+        """One API attempt without retries: "ok", "budget" or "failed". On failure the current data stays."""
         try:
-            data = await self._async_update_data()
+            data = await self._fetch_prices(max_retries=1)
+        except BudgetExhausted as err:
+            _LOGGER.info("One-shot %s price fetch not sent: %s", self.price_type, err)
+            return "budget"
         except Exception as err:
             _LOGGER.warning("One-shot %s price fetch failed, keeping current data: %s", self.price_type, err)
-            return False
-        finally:
-            self.retry_attempts = retry_attempts
+            return "failed"
         self.async_set_updated_data(data)
-        return True
+        return "ok"
 
     def schedule_hourly_update(self):
         if self._unsub_hourly:

@@ -11,6 +11,7 @@ from .update_coordinator import PstrykDataUpdateCoordinator, is_likely_placehold
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
 from .web_watch import PstrykWebSignalWatcher
+from .price_policy import startup_fetch_needed
 from .const import (
     DOMAIN,
     CONF_MQTT_48H_MODE,
@@ -62,7 +63,8 @@ async def async_setup_entry(
 
     api_client_key = f"{entry.entry_id}_api_client"
     if api_client_key not in hass.data[DOMAIN]:
-        api_client = PstrykAPIClient(hass, api_key)
+        api_client = PstrykAPIClient(hass, api_key, entry.entry_id)
+        await api_client.async_load_budget()
         hass.data[DOMAIN][api_client_key] = api_client
     else:
         api_client = hass.data[DOMAIN][api_client_key]
@@ -95,6 +97,22 @@ async def async_setup_entry(
     _LOGGER.info("Starting quick initialization - loading price coordinators only")
 
     async def safe_initial_fetch(coord, coord_type):
+        # Cache first: a restart spends no API request while the cache holds
+        # today's prices (and tomorrow's, once they are due after 12:05).
+        cached = await coord._load_cache()
+        if cached is not None:
+            now = dt_util.now()
+            today = now.strftime("%Y-%m-%d")
+            today_hours = sum(1 for p in cached.get("prices", []) if p.get("start", "").startswith(today))
+            has_tomorrow = coord._check_has_valid_tomorrow(cached)
+            cached["is_cached"] = True
+            coord.data = cached
+            coord._has_tomorrow = has_tomorrow
+            if not startup_fetch_needed(today_hours, has_tomorrow, now):
+                coord.last_update_success = True
+                _LOGGER.info("%s prices loaded from cache (tomorrow: %s), no API request",
+                             coord_type, has_tomorrow)
+                return True
         try:
             data = await coord._async_update_data()
             coord.data = data
@@ -146,8 +164,8 @@ async def async_setup_entry(
                 sell_coord = coordinator
 
         elif coordinator_type == "cost":
+            # No start-up fetch: cost runs at :50 on budget the prices leave free.
             coordinator.schedule_hourly_update()
-            coordinator.schedule_midnight_update()
 
     if entry.options.get(CONF_WEB_SIGNAL, False):
         watcher = PstrykWebSignalWatcher(hass, entry.entry_id, get_integration_version(hass))
@@ -177,26 +195,6 @@ async def async_setup_entry(
     _LOGGER.info("Registering %d current price sensors with data and %d additional sensors as unavailable",
                  len(entities), len(remaining_entities))
     async_add_entities(entities + remaining_entities)
-
-    async def lazy_load_cost_data():
-        _LOGGER.info("Waiting 15 seconds before loading cost coordinator data")
-        await asyncio.sleep(15)
-
-        _LOGGER.info("Loading cost coordinator data in background")
-        try:
-            data = await cost_coordinator._async_update_data()
-            cost_coordinator.data = data
-            cost_coordinator.last_update_success = True
-            cost_coordinator.async_update_listeners()
-            _LOGGER.info("Cost coordinator loaded successfully - %d sensors updated",
-                        len(remaining_entities))
-        except Exception as err:
-            _LOGGER.warning("Failed to load cost coordinator: %s. %d sensors remain unavailable.",
-                          err, len(remaining_entities))
-            cost_coordinator.last_update_success = False
-            cost_coordinator.data = None
-
-    entry.async_create_background_task(hass, lazy_load_cost_data(), f"{DOMAIN}_lazy_cost_load")
 
 
 class PstrykPriceSensor(CoordinatorEntity, SensorEntity):

@@ -1,7 +1,8 @@
 """Experimental: watch pstryk.pl for tomorrow's prices and fetch them once when they appear.
 
 From 12:00 to 13:55 local, every 5 minutes, while tomorrow's prices are missing.
-When the next-day button turns active, one price fetch follows. Anything
+When the next-day button turns active, one price fetch follows, if the hourly
+API budget has room; otherwise it is tried again at the next check. Anything
 unexpected (page unreachable, button gone, fetch without tomorrow) ends the
 check for the day; the regular schedule (14:00 in 48h mode, 00:01) still runs.
 """
@@ -15,7 +16,7 @@ from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.util import dt as dt_util
 
 from .const import WEB_SIGNAL_URL
-from .price_refresh import async_refresh_prices, has_tomorrow, refresh_guarded
+from .price_refresh import async_refresh_prices, has_tomorrow
 from .web_signal import next_day_published, next_web_check
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,19 +82,19 @@ class PstrykWebSignalWatcher:
             _LOGGER.debug("Tomorrow's prices not on pstryk.pl yet")
             return
 
-        if refresh_guarded(self.hass, self.entry_id):
-            # A fetch (e.g. at startup) ran less than 20 minutes ago; try at a later check.
-            _LOGGER.info("Tomorrow's prices are on pstryk.pl; waiting for the 20-minute guard before fetching")
+        _LOGGER.info("Tomorrow's prices are on pstryk.pl, fetching them once")
+        result = await async_refresh_prices(self.hass, self.entry_id, "pstryk.pl signal")
+        if result == "budget":
+            # Nothing was sent; try again at the next check.
             return
 
         self._done_date = today
-        _LOGGER.info("Tomorrow's prices are on pstryk.pl, fetching them once")
-        if await async_refresh_prices(self.hass, self.entry_id, "pstryk.pl signal"):
+        if result == "found":
             _LOGGER.info("Found tomorrow prices after the pstryk.pl signal")
         else:
             _LOGGER.warning(
-                "pstryk.pl showed tomorrow's prices but the fetch did not return them; "
-                "waiting for the regular schedule"
+                "pstryk.pl showed tomorrow's prices but the fetch did not return them (%s); "
+                "waiting for the regular schedule", result
             )
 
     async def _fetch_signal(self):

@@ -2,6 +2,9 @@
 DOMAIN = "pstryk"
 API_URL = "https://api.pstryk.pl/integrations/"
 API_TIMEOUT = 60
+# pstryk.pl/regulamin-api: 3 requests/hour per endpoint. Prices and costs share one endpoint.
+API_HOURLY_LIMIT = 3
+REQUEST_LOG_STORE_VERSION = 1
 
 PRICING_ENDPOINT = (
     "meter-data/unified-metrics/?metrics=pricing"

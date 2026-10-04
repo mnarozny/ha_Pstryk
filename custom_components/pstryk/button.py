@@ -1,11 +1,13 @@
 import logging
 
+from homeassistant.components import persistent_notification
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .price_refresh import async_refresh_prices
+from .price_refresh import async_refresh_prices, budget_free_at
 from .sensor import get_integration_version
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,7 +22,7 @@ async def async_setup_entry(
 
 
 class PstrykRefreshPricesButton(ButtonEntity):
-    """Fetch buy and sell prices once. Ignored within 20 minutes of the last fetch."""
+    """Fetch buy and sell prices once, if the hourly API budget has room."""
 
     _attr_icon = "mdi:refresh"
 
@@ -48,4 +50,17 @@ class PstrykRefreshPricesButton(ButtonEntity):
 
     async def async_press(self) -> None:
         # Coordinators are created by the sensor platform, so look them up at press time.
-        await async_refresh_prices(self.hass, self.entry_id, "button")
+        result = await async_refresh_prices(self.hass, self.entry_id, "button")
+        if result == "budget":
+            free_at = budget_free_at(self.hass, self.entry_id)
+            persistent_notification.async_create(
+                self.hass,
+                "Pstryk allows 3 API requests per hour and this hour's are used. "
+                f"Prices were not refreshed. Next free slot: "
+                f"{dt_util.as_local(free_at).strftime('%H:%M') if free_at else 'unknown'}.",
+                title="Pstryk: refresh not sent",
+                notification_id=f"{DOMAIN}_refresh_budget",
+            )
+        else:
+            persistent_notification.async_dismiss(self.hass, f"{DOMAIN}_refresh_budget")
+            _LOGGER.info("Refresh prices button: %s", result)

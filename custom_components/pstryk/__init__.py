@@ -143,6 +143,9 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
             if hasattr(coordinator, '_unsub_afternoon') and coordinator._unsub_afternoon:
                 coordinator._unsub_afternoon()
                 coordinator._unsub_afternoon = None
+            if getattr(coordinator, '_unsub_budget_retry', None):
+                coordinator._unsub_budget_retry()
+                coordinator._unsub_budget_retry = None
             hass.data[DOMAIN].pop(key, None)
     
     cost_key = f"{entry.entry_id}_cost"

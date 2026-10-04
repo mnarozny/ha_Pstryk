@@ -8,18 +8,37 @@ from email.utils import parsedate_to_datetime
 import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util import dt as dt_util
 
-from .const import API_TIMEOUT
+from .const import API_TIMEOUT, API_HOURLY_LIMIT, DOMAIN, REQUEST_LOG_STORE_VERSION
+from .request_budget import RequestBudget
 
 _LOGGER = logging.getLogger(__name__)
 
 
+class BudgetExhausted(UpdateFailed):
+    """No request was sent: the hourly API budget has no room for it."""
+
+    def __init__(self, endpoint_key: str, free_at):
+        self.endpoint_key = endpoint_key
+        self.free_at = free_at
+        super().__init__(
+            f"API budget for {endpoint_key} is full ({API_HOURLY_LIMIT}/h); "
+            f"next slot at {dt_util.as_local(free_at).strftime('%H:%M:%S') if free_at else 'unknown'}"
+        )
+
+
 class PstrykAPIClient:
 
-    def __init__(self, hass: HomeAssistant, api_key: str):
+    def __init__(self, hass: HomeAssistant, api_key: str, entry_id: str | None = None):
         self.hass = hass
         self.api_key = api_key
+
+        # Every HTTP attempt is counted per endpoint, and the log survives restarts.
+        self._budgets: Dict[str, RequestBudget] = {}
+        self._store = Store(hass, REQUEST_LOG_STORE_VERSION, f"{DOMAIN}_request_log_{entry_id or 'default'}")
         self._session: Optional[aiohttp.ClientSession] = None
 
         self._rate_limits: Dict[str, Dict[str, Any]] = {}
@@ -40,6 +59,32 @@ class PstrykAPIClient:
         if "meter-data/unified-metrics" in url:
             return "unified-metrics"
         return "unknown"
+
+    def _budget(self, endpoint_key: str) -> RequestBudget:
+        if endpoint_key not in self._budgets:
+            self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT)
+        return self._budgets[endpoint_key]
+
+    async def async_load_budget(self) -> None:
+        data = await self._store.async_load() or {}
+        for endpoint_key, value in data.items():
+            self._budgets[endpoint_key] = RequestBudget.from_dict(value, API_HOURLY_LIMIT)
+        _LOGGER.debug("Loaded API request log: %s", {
+            key: budget.used(dt_util.utcnow()) for key, budget in self._budgets.items()
+        })
+
+    async def _save_budget(self) -> None:
+        now = dt_util.utcnow()
+        try:
+            await self._store.async_save({key: b.to_dict(now) for key, b in self._budgets.items()})
+        except Exception as err:
+            _LOGGER.warning("Failed to save the API request log: %s", err)
+
+    def budget_has_room(self, endpoint_key: str = "unified-metrics", keep_free: int = 0) -> bool:
+        return self._budget(endpoint_key).has_room(dt_util.utcnow(), keep_free)
+
+    def budget_free_at(self, endpoint_key: str = "unified-metrics", keep_free: int = 0):
+        return self._budget(endpoint_key).free_at(dt_util.utcnow(), keep_free)
 
     async def _check_rate_limit(self, endpoint_key: str) -> Optional[float]:
         async with self._rate_limit_lock:
@@ -79,6 +124,8 @@ class PstrykAPIClient:
             wait_time = 3600
 
         retry_after_dt = datetime.now() + timedelta(seconds=wait_time)
+        self._budget(endpoint_key).block_until(dt_util.utcnow() + timedelta(seconds=wait_time))
+        await self._save_budget()
 
         async with self._rate_limit_lock:
             self._rate_limits[endpoint_key] = {
@@ -95,7 +142,8 @@ class PstrykAPIClient:
         self,
         url: str,
         max_retries: int = 3,
-        base_delay: float = 20.0
+        base_delay: float = 20.0,
+        keep_free: int = 0
     ) -> Dict[str, Any]:
 
         endpoint_key = self._get_endpoint_key(url)
@@ -120,6 +168,11 @@ class PstrykAPIClient:
         last_exception = None
 
         for attempt in range(max_retries):
+            budget = self._budget(endpoint_key)
+            if not budget.claim(dt_util.utcnow(), keep_free):
+                raise BudgetExhausted(endpoint_key, budget.free_at(dt_util.utcnow(), keep_free))
+            await self._save_budget()
+
             try:
                 async with self._request_semaphore:
                     async with asyncio.timeout(API_TIMEOUT):
@@ -243,14 +296,16 @@ class PstrykAPIClient:
         self,
         url: str,
         max_retries: int = 3,
-        base_delay: float = 20.0
+        base_delay: float = 20.0,
+        keep_free: int = 0
     ) -> Dict[str, Any]:
+        """GET `url`. Each attempt needs room in the hourly budget, leaving `keep_free` slots."""
         async with self._in_flight_lock:
             task = self._in_flight.get(url)
             created = task is None
             if created:
                 task = asyncio.create_task(
-                    self._make_request(url, max_retries, base_delay)
+                    self._make_request(url, max_retries, base_delay, keep_free)
                 )
                 self._in_flight[url] = task
             else:
