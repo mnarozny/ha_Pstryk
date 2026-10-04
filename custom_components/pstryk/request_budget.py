@@ -47,6 +47,11 @@ class RequestBudget:
             self._times[self._times.index(claimed)] = sent
         return sent
 
+    def release(self, claimed: datetime) -> None:
+        """Give back a claimed slot whose request was never sent."""
+        if claimed in self._times:
+            self._times.remove(claimed)
+
     def free_at(self, now: datetime, keep_free: int = 0) -> datetime | None:
         """When `has_room(..., keep_free)` becomes true; None if it already is."""
         if self.has_room(now, keep_free):

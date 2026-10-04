@@ -87,3 +87,11 @@ def test_restamp_moves_one_request_to_its_send_time():
     assert budget.to_dict(T0 + timedelta(seconds=1))["times"] == [T0.isoformat(), sent.isoformat()]
     assert budget.restamp(T0 - timedelta(hours=5), T0) == T0  # unknown stamp: nothing to move
     assert budget.used(T0 + timedelta(seconds=1)) == 2
+
+
+def test_release_gives_a_claimed_slot_back():
+    budget = RequestBudget(1)
+    assert budget.claim(_utc(10, 5))
+    budget.release(_utc(10, 5))
+    budget.release(_utc(9, 0))  # unknown stamp: nothing to give back
+    assert budget.claim(_utc(10, 6))

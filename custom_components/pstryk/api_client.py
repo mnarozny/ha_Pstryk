@@ -117,12 +117,23 @@ class SharedRequestLog:
             self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT, BUDGET_WINDOW)
         return self._budgets[endpoint_key]
 
-    async def async_save(self) -> None:
+    def _data(self) -> dict:
         now = dt_util.utcnow()
+        return {key: b.to_dict(now) for key, b in self._budgets.items()}
+
+    async def async_save(self) -> None:
         try:
-            await self._store.async_save({key: b.to_dict(now) for key, b in self._budgets.items()})
+            await self._store.async_save(self._data())
         except Exception as err:
             _LOGGER.warning("Failed to save the API request log: %s", err)
+
+    def save_soon(self) -> None:
+        """Save without waiting for it: within a second, or when Home Assistant stops.
+
+        Used at the moment of sending, where an awaited save would put the
+        request later than its recorded time again.
+        """
+        self._store.async_delay_save(self._data, 1)
 
 
 REQUEST_LOG_KEY = "request_log"
@@ -154,6 +165,7 @@ async def async_validate_api_key(hass: HomeAssistant, api_key: str) -> bool | No
         session = async_get_clientsession(hass)
         async with asyncio.timeout(API_TIMEOUT):
             budget.restamp(claimed, dt_util.utcnow())
+            request_log.save_soon()
             resp = await session.get(url, headers={"Authorization": api_key, "Accept": "application/json"})
     except (Exception, asyncio.TimeoutError):
         return False
@@ -296,14 +308,20 @@ class PstrykAPIClient:
             claimed = await async_claim_slot(budget, keep_free, self._check_open)
             if claimed is None:
                 raise BudgetExhausted(endpoint_key, budget.free_at(dt_util.utcnow(), keep_free))
-            # Saved before sending, so a crash cannot lose it. The saved time is
-            # the claim; the send time below reaches the file with the next save.
+            # Saved before sending, so a crash cannot lose it. That save holds the
+            # claim time; the send time below follows it to the file unawaited.
             await self._save_budget()
 
             try:
                 async with self._request_semaphore:
                     async with asyncio.timeout(API_TIMEOUT):
+                        if self.closed:
+                            # Unloaded during the awaits above: not sent, slot given back.
+                            budget.release(claimed)
+                            self._request_log.save_soon()
+                            self._check_open()
                         budget.restamp(claimed, dt_util.utcnow())
+                        self._request_log.save_soon()
                         async with self.session.get(url, headers=headers) as response:
                             if response.status == 200:
                                 data = await response.json()
@@ -380,6 +398,9 @@ class PstrykAPIClient:
                                     raise UpdateFailed(
                                         f"API error {response.status} for {endpoint_key}"
                                     )
+
+            except ClientClosed:
+                raise
 
             except asyncio.TimeoutError as err:
                 last_exception = err

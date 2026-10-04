@@ -34,6 +34,7 @@ STORE_DISK = {}  # survives "restarts": one dict per store key
 SCHEDULED = []  # (when_utc, callback) from async_track_point_in_time
 NOTIFICATIONS = {}
 SAVE_DELAYS_MS = []  # how long each request-log save takes on the fake clock; then 0
+DURING_SAVE = []  # callables, one run inside each request-log save
 
 
 def _set_clock(*args):
@@ -82,6 +83,11 @@ class _Store:
         STORE_DISK[self.key] = copy.deepcopy(data)
         if SAVE_DELAYS_MS:
             CLOCK[0] += timedelta(milliseconds=SAVE_DELAYS_MS.pop(0))
+        if DURING_SAVE:
+            DURING_SAVE.pop(0)()
+
+    def async_delay_save(self, data_func, delay=0):
+        STORE_DISK[self.key] = copy.deepcopy(data_func())
 
 
 def _track(hass, callback, when):
@@ -242,6 +248,7 @@ def env(mods, monkeypatch):
     NOTIFICATIONS.clear()
     CACHE.clear()
     SAVE_DELAYS_MS.clear()
+    DURING_SAVE.clear()
     _set_clock(2026, 10, 2, 12, 5)
     hass = _Hass()
 
@@ -919,3 +926,54 @@ def test_review4_a_cache_without_an_owner_is_not_trusted(mods, env):
 
     assert _run(scenario()) is False
     assert len(env.hass.session.sent) == 2
+
+
+# Fifth review (Codex on 4f2a2ef).
+
+
+def test_review5_unload_during_the_log_save_sends_nothing(mods, env):
+    async def scenario():
+        env.hass.session.pricing = EARLY
+        _at(4, 12, 9)
+        client, coords = await env.build()
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        _at(4, 12, 10, 0, 100)
+        await poller.async_check()
+        DURING_SAVE.append(client.close)  # unloaded while the claim is being saved
+        _at(4, 12, 30, 0, 100)
+        return await poller.async_check()
+
+    assert _run(scenario()) == "stopped"
+    assert len(env.hass.session.sent) == 1
+    assert _used(env) == 1  # the slot it had claimed is given back, on disk too
+
+
+def test_review5_a_restart_restores_the_send_time(mods, env):
+    # The save before the third request takes 3 s, longer than the margin.
+    async def scenario(restart):
+        env.hass.session.pricing = EARLY
+        _at(4, 12, 9)
+        client, coords = await env.build()
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        SAVE_DELAYS_MS.extend([10, 10, 3000])
+        for minute in (10, 30, 50):
+            _at(4, 12, minute, 0, 100)
+            await poller.async_check()
+        if restart:
+            env.hass.data["pstryk"].clear()
+            client, coords = await env.build()
+            poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        for minute in (10, 30, 50):
+            _at(4, 13, minute, 0, 100)
+            await poller.async_check()
+        return list(env.hass.session.sent)
+
+    for restart in (True, False):
+        env.hass.session.sent.clear()
+        STORE_DISK.clear()
+        env.hass.data["pstryk"].clear()
+        sent = _run(scenario(restart))
+        assert len(sent) == 6
+        assert sent[2] == datetime(2026, 10, 4, 12, 50, 3, 100000, tzinfo=TZ)
+        assert sent[5] - sent[2] >= timedelta(hours=1, seconds=2)
+        assert env.hass.session.max_in_any_hour() == 3
