@@ -25,7 +25,8 @@ Integracja korzysta  z nowego endpointu `unified-metrics`
 - Średnia cena z pozostałej ilości godzin do końca doby  
 - Średnia cena wschód/zachód  
 - Automatyczna konwersja czasu UTC → lokalny  
-- Dane są aktualizowane minutę po pełnej godzinie  
+- Ceny na jutro pobierane od 12:10; integracja pilnuje limitu 3 zapytań API na godzinę (patrz [Limit API i harmonogram pobierania](#limit-api-i-harmonogram-pobierania))  
+- Przycisk do ręcznego odświeżenia cen i sensor z czasem ich pobrania  
 - Konfiguracja z poziomu integracji  
 - Walidacja klucza API / Cache danych / Zabezpieczenie przed timeoutem API  
 - Integracja wystawia po lokalnym MQTT tablice cen w natywnym formacie EVCC  
@@ -84,6 +85,20 @@ Integracja korzysta  z nowego endpointu `unified-metrics`
 | `sensor.pstryk_yearly_financial_balance` | Roczny bilans kupna/sprzedaży                |
 | `sensor.pstryk_json_buy`                | Ceny kupna 48h w formacie JSON (opcjonalny)  |
 | `sensor.pstryk_json_sell`               | Ceny sprzedaży 48h w formacie JSON (opcjonalny) |
+| `sensor.pstryk_prices_fetched`          | Czas pobrania z API cen, które są teraz w użyciu |
+| `button.pstryk_refresh_prices`          | Jednorazowe pobranie cen kupna i sprzedaży   |
+
+### Limit API i harmonogram pobierania
+
+Pstryk pozwala na 3 zapytania na godzinę na endpoint ([regulamin API](https://pstryk.pl/regulaminy?doc=regulamin-api)). Ceny i koszty korzystają z tego samego endpointu `unified-metrics`, więc integracja liczy każde wysłane zapytanie (także ponowienia i sprawdzenie klucza API przy konfiguracji) w jednym limicie z ostatnich 60 minut. Gdy limit jest wykorzystany, zapytanie nie jest wysyłane. Historia zapytań jest zapisywana, więc restart Home Assistanta jej nie zeruje. Wyjątek: po nagłym zatrzymaniu Home Assistanta (awaria, zanik zasilania) tuż po wysłaniu zapytania zapisany czas może być o kilka sekund wcześniejszy od rzeczywistego, więc na granicy godziny może wyjść czwarte zapytanie.
+
+- **Ceny mają pierwszeństwo.** Pobranie cen może użyć każdego wolnego zapytania. Przy wykorzystanym limicie sensory cen zostają przy dotychczasowych danych, a pobranie rusza, gdy zwolni się miejsce.
+- **Ceny na jutro** są sprawdzane o 12:10, 12:30, 12:50 i dalej co 20 minut, aż się pojawią. Jedno sprawdzenie to jedno zapytanie dla kupna i sprzedaży, bez ponowień. Działa to w każdym trybie i zastępuje sprawdzanie między 14:00 a 15:00.
+- **O 00:01** pobierane są ceny na nowy dzień.
+- **Koszty, średnie i bilans** są pobierane o :50 każdej godziny i tylko z zapytań, których nie potrzebują ceny: nie o 11:50 i 23:50, a po 12:00 dopiero wtedy, gdy ceny na jutro są już pobrane. Po restarcie te sensory są niedostępne do pierwszego takiego pobrania.
+- **Restart:** integracja wczytuje ceny z pamięci podręcznej. Jeśli są w niej dzisiejsze ceny, nie wysyła zapytania. Jeśli brakuje tylko cen na jutro (po 12:05), wysyła jedno.
+- **`button.pstryk_refresh_prices`** pobiera ceny kupna i sprzedaży jednym zapytaniem. Przy wykorzystanym limicie nic nie wysyła i pokazuje powiadomienie z godziną, o której zwolni się miejsce.
+- **`sensor.pstryk_prices_fetched`** pokazuje, kiedy ceny będące teraz w użyciu zostały pobrane z API. Atrybut `tomorrow_available` mówi, czy są już ceny na jutro.
 
 ### Sensory JSON (opcjonalne)
 

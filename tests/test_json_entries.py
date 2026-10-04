@@ -86,6 +86,7 @@ def _stubs():
         "homeassistant.helpers.event": _stub(
             "homeassistant.helpers.event", async_track_point_in_time=lambda *a, **k: None
         ),
+        "homeassistant.helpers.storage": _stub("homeassistant.helpers.storage", Store=object),
         "homeassistant.helpers.restore_state": _stub(
             "homeassistant.helpers.restore_state", RestoreEntity=type("RestoreEntity", (), {})
         ),
@@ -103,7 +104,7 @@ def _stubs():
             "homeassistant.components.sensor",
             SensorEntity=type("SensorEntity", (), {}),
             SensorStateClass=types.SimpleNamespace(MEASUREMENT="measurement", TOTAL="total"),
-            SensorDeviceClass=types.SimpleNamespace(MONETARY="monetary"),
+            SensorDeviceClass=types.SimpleNamespace(MONETARY="monetary", TIMESTAMP="timestamp"),
         ),
         "homeassistant.loader": _stub("homeassistant.loader", async_get_integration=None),
         "aiohttp": aiohttp,
