@@ -61,6 +61,16 @@ class PstrykRefreshPricesButton(ButtonEntity):
                 title="Pstryk: refresh not sent",
                 notification_id=f"{DOMAIN}_refresh_budget",
             )
-        else:
-            persistent_notification.async_dismiss(self.hass, f"{DOMAIN}_refresh_budget")
-            _LOGGER.info("Refresh prices button: %s", result)
+            return
+        persistent_notification.async_dismiss(self.hass, f"{DOMAIN}_refresh_budget")
+        if result == "failed":
+            persistent_notification.async_create(
+                self.hass,
+                "Prices were not refreshed: the request to Pstryk failed. The current prices stay "
+                "in use; the Home Assistant log has the reason.",
+                title="Pstryk: refresh failed",
+                notification_id=f"{DOMAIN}_refresh_failed",
+            )
+            return
+        persistent_notification.async_dismiss(self.hass, f"{DOMAIN}_refresh_failed")
+        _LOGGER.info("Refresh prices button: %s", result)

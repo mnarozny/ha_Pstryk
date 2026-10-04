@@ -1,9 +1,9 @@
 {
   "name": "ha_Pstryk",
-  "domains": ["sensor"],
+  "domains": ["sensor", "button"],
   "content_in_root": false,
   "country": "PL",
   "render_readme": true,
-  "documentation": "https://github.com/balgerion/ha_Pstryk/blob/main/README.md",
-  "issue_tracker": "https://github.com/balgerion/ha_Pstryk/issues"
+  "documentation": "https://github.com/mnarozny/ha_Pstryk/blob/main/README.md",
+  "issue_tracker": "https://github.com/mnarozny/ha_Pstryk/issues"
 }

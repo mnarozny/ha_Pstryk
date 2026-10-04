@@ -12,10 +12,51 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .const import API_TIMEOUT, API_URL, API_HOURLY_LIMIT, DOMAIN, PRICING_ENDPOINT, REQUEST_LOG_STORE_VERSION
+from .const import (
+    API_TIMEOUT,
+    API_URL,
+    API_HOURLY_LIMIT,
+    API_SLOT_WAIT_SECONDS,
+    DOMAIN,
+    PRICING_ENDPOINT,
+    REQUEST_LOG_STORE_VERSION,
+)
 from .request_budget import RequestBudget
 
 _LOGGER = logging.getLogger(__name__)
+
+DEFAULT_RETRY_AFTER_SECONDS = 3600
+
+
+async def _sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def retry_after_seconds(headers, now: datetime) -> float:
+    """Seconds to wait after a 429: Retry-After as seconds or an HTTP date, else an hour."""
+    value = headers.get("Retry-After")
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return (parsedate_to_datetime(value) - now).total_seconds()
+            except Exception:
+                pass
+    return DEFAULT_RETRY_AFTER_SECONDS
+
+
+async def async_claim_slot(budget: RequestBudget, keep_free: int = 0) -> bool:
+    """Record a request if the budget has room, or will have within API_SLOT_WAIT_SECONDS."""
+    now = dt_util.utcnow()
+    if budget.claim(now, keep_free):
+        return True
+    free_at = budget.free_at(now, keep_free)
+    wait = (free_at - now).total_seconds() if free_at else None
+    if wait is None or wait > API_SLOT_WAIT_SECONDS:
+        return False
+    await _sleep(wait + 0.05)
+    return budget.claim(dt_util.utcnow(), keep_free)
 
 
 class BudgetExhausted(UpdateFailed):
@@ -89,16 +130,23 @@ async def async_validate_api_key(hass: HomeAssistant, api_key: str) -> bool | No
         end=(now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     request_log = await async_get_request_log(hass)
-    if not request_log.budget("unified-metrics").claim(dt_util.utcnow()):
+    budget = request_log.budget("unified-metrics")
+    if not await async_claim_slot(budget):
         return None
     await request_log.async_save()
     try:
         session = async_get_clientsession(hass)
         async with asyncio.timeout(API_TIMEOUT):
             resp = await session.get(url, headers={"Authorization": api_key, "Accept": "application/json"})
-            return resp.status == 200
     except (Exception, asyncio.TimeoutError):
         return False
+    if resp.status == 429:
+        # Pstryk asks us to wait; that says nothing about the key.
+        now = dt_util.utcnow()
+        budget.block_until(now + timedelta(seconds=retry_after_seconds(resp.headers, now)))
+        await request_log.async_save()
+        return None
+    return resp.status == 200
 
 
 class PstrykAPIClient:
@@ -139,11 +187,13 @@ class PstrykAPIClient:
     async def _save_budget(self) -> None:
         await self._request_log.async_save()
 
-    def budget_has_room(self, endpoint_key: str = "unified-metrics", keep_free: int = 0) -> bool:
-        return self._budget(endpoint_key).has_room(dt_util.utcnow(), keep_free)
-
     def budget_free_at(self, endpoint_key: str = "unified-metrics", keep_free: int = 0):
         return self._budget(endpoint_key).free_at(dt_util.utcnow(), keep_free)
+
+    def budget_room_soon(self, endpoint_key: str = "unified-metrics", keep_free: int = 0) -> bool:
+        """Room now, or within the time a request waits for a slot."""
+        free_at = self.budget_free_at(endpoint_key, keep_free)
+        return free_at is None or (free_at - dt_util.utcnow()).total_seconds() <= API_SLOT_WAIT_SECONDS
 
     async def _check_rate_limit(self, endpoint_key: str) -> Optional[float]:
         async with self._rate_limit_lock:
@@ -166,21 +216,7 @@ class PstrykAPIClient:
 
     async def _handle_rate_limit(self, response: aiohttp.ClientResponse, endpoint_key: str):
 
-        retry_after_header = response.headers.get("Retry-After")
-        wait_time = None
-
-        if retry_after_header:
-            try:
-                wait_time = int(retry_after_header)
-            except ValueError:
-                try:
-                    retry_date = parsedate_to_datetime(retry_after_header)
-                    wait_time = (retry_date - datetime.now()).total_seconds()
-                except Exception:
-                    pass
-
-        if wait_time is None:
-            wait_time = 3600
+        wait_time = retry_after_seconds(response.headers, dt_util.utcnow())
 
         retry_after_dt = datetime.now() + timedelta(seconds=wait_time)
         self._budget(endpoint_key).block_until(dt_util.utcnow() + timedelta(seconds=wait_time))
@@ -229,7 +265,7 @@ class PstrykAPIClient:
 
         for attempt in range(max_retries):
             budget = self._budget(endpoint_key)
-            if not budget.claim(dt_util.utcnow(), keep_free):
+            if not await async_claim_slot(budget, keep_free):
                 raise BudgetExhausted(endpoint_key, budget.free_at(dt_util.utcnow(), keep_free))
             await self._save_budget()
 

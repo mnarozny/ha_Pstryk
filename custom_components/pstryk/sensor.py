@@ -97,16 +97,11 @@ async def async_setup_entry(
 
     async def safe_initial_fetch(coord, coord_type):
         # Cache first: a restart spends no API request while the cache holds
-        # today's published prices (and tomorrow's, once they are due after 12:05).
-        if await coord.async_load_startup_cache():
-            _LOGGER.info("%s prices loaded from cache (tomorrow: %s), no API request",
-                         coord_type, coord._has_tomorrow)
-            return True
+        # today's published prices, and one attempt if only tomorrow's are due.
         try:
-            data = await coord._async_update_data()
-            coord.data = data
-            coord.last_update_success = True
-            _LOGGER.debug("Successfully initialized %s coordinator", coord_type)
+            await coord.async_startup()
+            _LOGGER.debug("Successfully initialized %s coordinator (cached: %s, tomorrow: %s)",
+                          coord_type, coord.data.get("is_cached", False), coord._has_tomorrow)
             return True
         except Exception as err:
             _LOGGER.error("Failed initial fetch for %s coordinator: %s", coord_type, err)

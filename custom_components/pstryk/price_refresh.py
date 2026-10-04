@@ -1,4 +1,4 @@
-"""One fetch of buy and sell prices, shared by the refresh button and the website check."""
+"""One fetch of buy and sell prices, shared by the refresh button and the tomorrow checks."""
 import asyncio
 import logging
 

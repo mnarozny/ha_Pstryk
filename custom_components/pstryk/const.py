@@ -5,6 +5,10 @@ API_TIMEOUT = 60
 # pstryk.pl/regulamin-api: 3 requests/hour per endpoint. Prices and costs share one endpoint.
 API_HOURLY_LIMIT = 3
 REQUEST_LOG_STORE_VERSION = 1
+# A request that finds the budget full waits this long for a slot to free.
+# Checks repeat on the hour, so last hour's request often leaves the window a
+# moment after the timer fires.
+API_SLOT_WAIT_SECONDS = 10
 
 PRICING_ENDPOINT = (
     "meter-data/unified-metrics/?metrics=pricing"

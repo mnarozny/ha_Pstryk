@@ -311,7 +311,7 @@ class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Skipping cost update at %s: prices first", local_now.strftime("%H:%M"))
             self.schedule_hourly_update()
             return
-        if not self.api_client.budget_has_room(keep_free=COST_KEEP_FREE):
+        if not self.api_client.budget_room_soon(keep_free=COST_KEEP_FREE):
             _LOGGER.debug("Skipping cost update at %s: API budget kept for prices", local_now.strftime("%H:%M"))
             self.schedule_hourly_update()
             return

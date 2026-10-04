@@ -62,7 +62,6 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self.mqtt_48h_mode = mqtt_48h_mode
         self._unsub_hourly = None
         self._unsub_midnight = None
-        self._unsub_afternoon = None
         self._had_tomorrow_prices = False
         self._unsub_budget_retry = None
 
@@ -223,6 +222,22 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         self.last_update_success = True
         return not tomorrow_fetch_due(self._has_tomorrow, dt_util.now())
 
+    async def async_startup(self) -> None:
+        """Start-up: cache first, then as few API requests as the cache allows.
+
+        Today's prices cached and nothing due: no request. Today's cached and
+        only tomorrow's due: one attempt, and the cached prices stay in use
+        whatever it returns (the tomorrow checks carry on from there). No
+        usable cache: a fetch with the configured retries; its failure is raised.
+        """
+        if await self.async_load_startup_cache():
+            return
+        if self.data is not None:
+            await self.async_fetch_once()
+            return
+        self.data = await self._async_update_data()
+        self.last_update_success = True
+
     @callback
     def _arm_budget_retry(self, free_at):
         if self._unsub_budget_retry:
@@ -378,7 +393,8 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                     cache_date = last_updated.split("T")[0]
                     today_date = dt_util.now().strftime("%Y-%m-%d")
 
-                    if cache_date != today_date:
+                    # A fetch from yesterday afternoon already holds today's prices.
+                    if cache_date != today_date and not self.today_usable(cached_data):
                         _LOGGER.error("Cache for %s is from %s (today is %s) - OLD DATA! Marking as invalid.",
                                      self.price_type, cache_date, today_date)
 
@@ -411,7 +427,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             cached_data["is_cached"] = True
             self.data = self._for_today(cached_data)
             self.last_update_success = True
-            self._has_tomorrow = cached_data.get("has_tomorrow", False)
+            self._has_tomorrow = self._check_has_valid_tomorrow(self.data)
             self.async_update_listeners()
             _LOGGER.debug("Loaded %s data from cache (has_tomorrow=%s)",
                          self.price_type, self._has_tomorrow)
@@ -470,68 +486,3 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Sensors for %s are now UNAVAILABLE due to midnight fetch failure", self.price_type)
 
         self.schedule_midnight_update()
-
-    def schedule_afternoon_update(self):
-        if self._unsub_afternoon:
-            self._unsub_afternoon()
-            self._unsub_afternoon = None
-
-        if not self.mqtt_48h_mode:
-            _LOGGER.debug("Afternoon updates not scheduled for %s - 48h mode is disabled", self.price_type)
-            return
-
-        now = dt_util.now()
-
-        if now.hour < 14:
-            next_check = now.replace(hour=14, minute=0, second=0, microsecond=0)
-        elif now.hour == 14:
-            current_minutes = now.minute
-            if current_minutes < 15:
-                next_minutes = 15
-            elif current_minutes < 30:
-                next_minutes = 30
-            elif current_minutes < 45:
-                next_minutes = 45
-            else:
-                next_check = now.replace(hour=15, minute=0, second=0, microsecond=0)
-                next_minutes = None
-
-            if next_minutes is not None:
-                next_check = now.replace(minute=next_minutes, second=0, microsecond=0)
-        else:
-            next_check = (now + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)
-
-        if next_check <= now:
-            next_check = next_check + timedelta(minutes=15)
-
-        _LOGGER.info("Scheduling afternoon update check for %s at %s (48h mode, checking every 15min between 14:00-15:00)",
-                     self.price_type, next_check.strftime("%Y-%m-%d %H:%M:%S"))
-
-        self._unsub_afternoon = async_track_point_in_time(
-            self.hass, self._handle_afternoon_update, dt_util.as_utc(next_check)
-        )
-
-    async def _handle_afternoon_update(self, _):
-        now = dt_util.now()
-
-        if not self.mqtt_48h_mode:
-            _LOGGER.debug("Skipping afternoon update for %s (48h mode disabled)",
-                         self.price_type)
-            self.schedule_afternoon_update()
-            return
-
-        if self._has_tomorrow:
-            _LOGGER.debug("Already have tomorrow for %s, skipping afternoon fetch",
-                         self.price_type)
-            self.schedule_afternoon_update()
-            return
-
-        _LOGGER.info("Afternoon check for %s at %s - looking for tomorrow prices",
-                    self.price_type, now.strftime("%H:%M"))
-        await self.async_request_refresh()
-
-        if self._has_tomorrow:
-            _LOGGER.info("Found tomorrow prices for %s at %s",
-                        self.price_type, now.strftime("%H:%M"))
-
-        self.schedule_afternoon_update()
