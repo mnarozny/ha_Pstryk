@@ -19,21 +19,44 @@ def _local(*args):
     return datetime(*args, tzinfo=WARSAW)
 
 
+def _day(date, price=1.0, tge=0.5, hours=24, key=True):
+    entries = []
+    for h in range(hours):
+        entry = {"start": f"{date}T{h:02d}:00:00", "price": price}
+        if key:
+            entry["tge_price"] = tge
+        entries.append(entry)
+    return entries
+
+
 @pytest.mark.parametrize(
-    "today_hours, has_tomorrow, now, expected",
+    "entries, now, expected",
     [
-        (0, False, _local(2026, 10, 4, 9, 0), True),  # empty or stale cache
-        (12, False, _local(2026, 10, 4, 9, 0), True),  # partial day
-        (24, False, _local(2026, 10, 4, 11, 0), False),  # tomorrow not due yet
-        (24, False, _local(2026, 10, 4, 12, 4), False),
-        (24, False, _local(2026, 10, 4, 12, 5), True),  # tomorrow due, missing
-        (24, False, _local(2026, 10, 4, 12, 30), True),
-        (24, True, _local(2026, 10, 4, 12, 30), False),  # complete cache
-        (23, True, _local(2026, 10, 25, 20, 0), False),  # DST day has 25 hours, 23 is enough
+        (_day("2026-10-04"), _local(2026, 10, 4, 9, 0), True),
+        (_day("2026-10-04", key=False), _local(2026, 10, 4, 9, 0), True),  # cached before tge_price was kept
+        (_day("2026-10-04", price=0.0, tge=None), _local(2026, 10, 4, 9, 0), False),  # unpublished sell rows
+        (_day("2026-10-04", price=None, tge=None), _local(2026, 10, 4, 9, 0), False),  # unpublished buy rows
+        (_day("2026-10-03"), _local(2026, 10, 4, 9, 0), False),  # yesterday only
+        (_day("2026-10-04", hours=12), _local(2026, 10, 4, 9, 0), False),  # partial day
+        (_day("2026-10-04", hours=20), _local(2026, 10, 4, 21, 0), False),  # current hour missing
+        (_day("2026-10-04", hours=20), _local(2026, 10, 4, 19, 0), True),
     ],
 )
-def test_startup_fetch_needed(today_hours, has_tomorrow, now, expected):
-    assert price_policy.startup_fetch_needed(today_hours, has_tomorrow, now) is expected
+def test_today_published(entries, now, expected):
+    assert price_policy.today_published(entries, now) is expected
+
+
+@pytest.mark.parametrize(
+    "has_tomorrow, now, expected",
+    [
+        (False, _local(2026, 10, 4, 11, 0), False),  # not due yet
+        (False, _local(2026, 10, 4, 12, 4), False),
+        (False, _local(2026, 10, 4, 12, 5), True),  # due and missing
+        (True, _local(2026, 10, 4, 12, 30), False),
+    ],
+)
+def test_tomorrow_fetch_due(has_tomorrow, now, expected):
+    assert price_policy.tomorrow_fetch_due(has_tomorrow, now) is expected
 
 
 @pytest.mark.parametrize(

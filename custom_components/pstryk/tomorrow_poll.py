@@ -56,9 +56,15 @@ class PstrykTomorrowPoller:
             self._schedule()
 
     async def async_check(self) -> str:
+        if self._stopped:
+            return "stopped"
         if has_tomorrow(self.hass, self.entry_id):
             return "found"
-        result = await async_refresh_prices(self.hass, self.entry_id, "tomorrow check")
+        result = await async_refresh_prices(
+            self.hass, self.entry_id, "tomorrow check", is_current=lambda: not self._stopped
+        )
+        if result == "stopped":
+            return result
         if result == "found":
             _LOGGER.info("Found tomorrow's prices at %s", dt_util.now().strftime("%H:%M"))
         else:

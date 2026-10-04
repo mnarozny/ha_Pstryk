@@ -22,10 +22,26 @@ COST_SKIP_HOURS = frozenset({11, 23})
 COST_KEEP_FREE = 1
 
 
-def startup_fetch_needed(today_hours: int, has_tomorrow: bool, now: datetime) -> bool:
-    """Whether a start-up needs the API, given what the price cache holds."""
-    if today_hours < 20:
-        return True
+def today_published(entries: list[dict], now: datetime) -> bool:
+    """Whether cached price entries hold today's real prices, current hour included.
+
+    Before publication Pstryk sends rows anyway: buy with price null, sell 0.0,
+    both with tge_price null. Entries cached before tge_price was stored lack
+    the key and count as published (the caller also applies the placeholder check).
+    """
+    day = now.strftime("%Y-%m-%d")
+    hour = now.strftime("%Y-%m-%dT%H")
+    published = [
+        p for p in entries
+        if p.get("start", "").startswith(day)
+        and p.get("price") is not None
+        and ("tge_price" not in p or p["tge_price"] is not None)
+    ]
+    return len(published) >= 20 and any(p["start"].startswith(hour) for p in published)
+
+
+def tomorrow_fetch_due(has_tomorrow: bool, now: datetime) -> bool:
+    """Whether a start-up with today's prices cached should still fetch, for tomorrow."""
     return not has_tomorrow and (now.hour, now.minute) >= TOMORROW_EXPECTED_FROM
 
 

@@ -16,6 +16,7 @@ from .const import (
     DEFAULT_RETRY_DELAY
 )
 from .api_client import PstrykAPIClient, BudgetExhausted
+from .price_policy import today_published, tomorrow_fetch_due
 from .price_components import extract_components
 
 _LOGGER = logging.getLogger(__name__)
@@ -185,10 +186,42 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         except BudgetExhausted as err:
             # Prices come first: keep what we have and fetch as soon as a slot frees.
             self._arm_budget_retry(err.free_at)
-            if self.data:
+            if self.today_usable(self.data):
                 _LOGGER.info("%s prices: %s; keeping current data", self.price_type, err)
-                return self.data
+                return self._for_today(self.data)
             raise
+
+    def today_usable(self, data) -> bool:
+        """Whether `data` holds today's published prices, current hour included."""
+        if not data:
+            return False
+        now = dt_util.now()
+        today = now.strftime("%Y-%m-%d")
+        today_entries = [p for p in data.get("prices", []) if p.get("start", "").startswith(today)]
+        if not today_published(today_entries, now):
+            return False
+        # tge_price tells publication exactly; only older caches without it need the heuristic.
+        return any("tge_price" in p for p in today_entries) or not is_likely_placeholder_data(today_entries)
+
+    def _for_today(self, data):
+        """`data` with prices_today rebuilt for the current local date (it may be from yesterday)."""
+        today = dt_util.now().strftime("%Y-%m-%d")
+        return {**data, "prices_today": [p for p in data.get("prices", []) if p.get("start", "").startswith(today)]}
+
+    async def async_load_startup_cache(self) -> bool:
+        """Cache first. Use the cache if it holds today's published prices.
+
+        Returns True when no API request is needed; False when start-up should
+        fetch (no usable cache, or tomorrow's prices are due and missing).
+        Unusable cached rows are not exposed: data stays None until a fetch.
+        """
+        cached = await self._load_cache()
+        if not self.today_usable(cached):
+            return False
+        self.data = {**self._for_today(cached), "is_cached": True}
+        self._has_tomorrow = self._check_has_valid_tomorrow(self.data)
+        self.last_update_success = True
+        return not tomorrow_fetch_due(self._has_tomorrow, dt_util.now())
 
     @callback
     def _arm_budget_retry(self, free_at):
@@ -376,7 +409,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Could not parse cache date: %s", err)
 
             cached_data["is_cached"] = True
-            self.data = cached_data
+            self.data = self._for_today(cached_data)
             self.last_update_success = True
             self._has_tomorrow = cached_data.get("has_tomorrow", False)
             self.async_update_listeners()

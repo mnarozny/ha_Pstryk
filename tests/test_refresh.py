@@ -26,6 +26,9 @@ FIXTURES = Path(__file__).parent / "fixtures"
 TZ = ZoneInfo("Europe/Warsaw")
 CLOCK = [datetime(2026, 10, 2, 12, 5, tzinfo=TZ)]
 PRICING = json.loads((FIXTURES / "api_pricing_20261002T120545.json").read_text())
+# Fetched 2026-10-04 01:34: Oct 4 published, Oct 5 not (buy price null, sell 0.0).
+EARLY = json.loads((FIXTURES / "api_pricing_20261004T013435.json").read_text())
+CACHE = {}  # the integration's cache files, by price type
 
 STORE_DISK = {}  # survives "restarts": one dict per store key
 SCHEDULED = []  # (when_utc, callback) from async_track_point_in_time
@@ -179,10 +182,15 @@ def mods():
 
 
 class _Response:
-    def __init__(self, status, body):
-        self.status, self._body, self.headers = status, body, {}
+    def __init__(self, status, body, headers=None, gate=None):
+        self.status, self._body, self.headers, self._gate = status, body, headers or {}, gate
+
+    def __await__(self):  # the config flow awaits session.get() directly
+        return self.__aenter__().__await__()
 
     async def __aenter__(self):
+        if self._gate is not None:
+            await self._gate.wait()
         return self
 
     async def __aexit__(self, *exc):
@@ -201,12 +209,15 @@ class _Session:
     def __init__(self):
         self.sent = []
         self.statuses = []
+        self.headers = {}
+        self.pricing = PRICING
+        self.gate = None  # an asyncio.Event holds responses until set
 
     def get(self, url, headers=None):
         self.sent.append(CLOCK[0])
         status = self.statuses.pop(0) if self.statuses else 200
-        body = PRICING if "metrics=pricing" in url else {"frames": []}
-        return _Response(status, body)
+        body = self.pricing if "metrics=pricing" in url else {"frames": []}
+        return _Response(status, body, self.headers if status == 429 else None, self.gate)
 
     def max_in_any_hour(self):
         return max(
@@ -226,21 +237,26 @@ def env(mods):
     STORE_DISK.clear()
     SCHEDULED.clear()
     NOTIFICATIONS.clear()
+    CACHE.clear()
     _set_clock(2026, 10, 2, 12, 5)
     hass = _Hass()
 
     async def build():
-        client = mods.api.PstrykAPIClient(hass, "key", "e")
+        client = mods.api.PstrykAPIClient(hass, "key")
         await client.async_load_budget()
         client._calculate_backoff = lambda attempt, base_delay=20.0: 0
         coords = {}
         for price_type in ("buy", "sell"):
             coord = mods.uc.PstrykDataUpdateCoordinator(hass, client, price_type, False, 5, 30, "e")
 
-            async def _no_cache_write(data):
-                return None
+            async def _cache_write(data, price_type=price_type):
+                CACHE[price_type] = copy.deepcopy(data)
 
-            coord._save_cache = _no_cache_write
+            async def _cache_read(price_type=price_type):
+                return copy.deepcopy(CACHE.get(price_type))
+
+            coord._save_cache = _cache_write
+            coord._load_cache = _cache_read
             hass.data["pstryk"][f"e_{price_type}"] = coord
             coords[price_type] = coord
         return client, coords
@@ -325,14 +341,15 @@ def test_review_p2_concurrent_refreshes_keep_retries(mods, env):
 def test_retries_count_and_stop_at_the_budget(mods, env):
     async def scenario():
         client, coords = await env.build()
-        coords["buy"].data = {"prices": [], "kept": True}
+        await coords["buy"].async_request_refresh()  # 12:05: request 1, real prices
+        kept = coords["buy"].data["prices"]
         env.hass.session.statuses = [500, 500, 500, 500, 500]
         await coords["buy"].async_request_refresh()
-        return coords["buy"]
+        return coords["buy"], kept
 
-    buy = _run(scenario())
-    assert len(env.hass.session.sent) == 3  # 5 retries configured, budget allows 3
-    assert buy.data == {"prices": [], "kept": True}  # current data kept
+    buy, kept = _run(scenario())
+    assert len(env.hass.session.sent) == 3  # 5 retries configured, budget allows 2 more
+    assert buy.data["prices"] == kept  # current data kept
     assert buy.last_update_success is True
     assert buy._unsub_budget_retry is not None  # a fetch is booked for when a slot frees
     assert SCHEDULED[-1][0] == datetime(2026, 10, 2, 13, 5, 5, tzinfo=TZ).astimezone(timezone.utc)
@@ -437,3 +454,142 @@ def test_prices_fetched_sensor_shows_the_fetch_time(mods, env):
     assert fetched == datetime(2026, 10, 2, 12, 7, 30, tzinfo=TZ)
     assert later == fetched
     assert attrs == {"tomorrow_available": True}
+
+
+def _used(env):
+    """Requests in the saved log within the last hour (what the integration believes)."""
+    log = STORE_DISK.get("pstryk_request_log", {}).get("unified-metrics", {"times": []})
+    now = CLOCK[0].astimezone(timezone.utc)
+    return sum(1 for t in log["times"] if now - datetime.fromisoformat(t) < timedelta(hours=1))
+
+
+def test_review2_p1_api_key_check_counts(mods, env):
+    async def scenario():
+        env.hass.session.pricing = EARLY
+        _set_clock(2026, 10, 4, 12, 5)
+        valid = await mods.api.async_validate_api_key(env.hass, "key")  # config flow
+        client, coords = await env.build()  # fresh setup: no cache, fetch
+        await asyncio.gather(*(c.async_load_startup_cache() for c in coords.values()))
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        results = []
+        for minute in (10, 30):
+            _set_clock(2026, 10, 4, 12, minute)
+            results.append(await poller.async_check())
+        return valid, results
+
+    valid, results = _run(scenario())
+    assert valid is True
+    assert results == ["no_tomorrow", "budget"]
+    assert len(env.hass.session.sent) == 3
+    assert _used(env) == len(env.hass.session.sent)
+
+
+def test_api_key_check_waits_for_a_full_budget(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        await _two_more_calls(client)
+        await client.fetch(
+            "https://api.pstryk.pl/integrations/meter-data/unified-metrics/?metrics=cost", max_retries=1
+        )
+        return await mods.api.async_validate_api_key(env.hass, "key")
+
+    assert _run(scenario()) is None
+    assert len(env.hass.session.sent) == 3
+
+
+def test_review2_p2_reload_during_a_request_shares_one_budget(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # request 1
+        for c in coords.values():
+            c._has_tomorrow = False  # pretend tomorrow is still missing
+        env.hass.session.gate = asyncio.Event()
+        old_poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        _set_clock(2026, 10, 2, 12, 10)
+        press = asyncio.create_task(mods.refresh.async_refresh_prices(env.hass, "e", "button"))  # request 2
+        await asyncio.sleep(0)
+        queued = asyncio.create_task(old_poller.async_check())  # waits for the lock
+        await asyncio.sleep(0)
+        # Reload: the old generation is stopped and dropped; the request log stays.
+        old_poller.stop()
+        for key in [k for k in env.hass.data["pstryk"] if k.startswith("e_")]:
+            del env.hass.data["pstryk"][key]
+        env.hass.session.gate.set()
+        _, new_coords = await env.build()
+        CACHE.clear()  # force the replacement's start-up fetch
+        await asyncio.gather(*(c.async_load_startup_cache() for c in new_coords.values()))
+        await asyncio.gather(*(c.async_request_refresh() for c in new_coords.values()))  # request 3
+        return await press, await queued
+
+    press, queued = _run(scenario())
+    assert press == "found"
+    assert queued == "stopped"
+    assert len(env.hass.session.sent) == 3
+    assert _used(env) == 3
+
+
+def test_review2_p3_unpublished_rows_are_not_todays_prices(mods, env):
+    async def scenario():
+        env.hass.session.pricing = EARLY
+        _set_clock(2026, 10, 4, 1, 34, 35)
+        client, coords = await env.build()
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # cache Oct 4/5
+        env.hass.data["pstryk"].clear()
+        _set_clock(2026, 10, 5, 9, 0)
+        client, coords = await env.build()  # restart on Oct 5
+        loaded = {t: await c.async_load_startup_cache() for t, c in coords.items()}
+        # The budget is full, so the start-up fetch cannot replace the rows.
+        await _two_more_calls(client)
+        await client.fetch(
+            "https://api.pstryk.pl/integrations/meter-data/unified-metrics/?metrics=cost", max_retries=1
+        )
+        await coords["sell"].async_request_refresh()
+        return loaded, coords["sell"]
+
+    loaded, sell = _run(scenario())
+    assert loaded == {"buy": False, "sell": False}
+    assert sell.data is None
+    assert sell.last_update_success is False  # unavailable, not a 0.0 price
+
+
+def test_review2_p4_restart_after_midnight_rebuilds_today(mods, env):
+    async def scenario():
+        _set_clock(2026, 10, 2, 13, 0)
+        client, coords = await env.build()
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # cache Oct 2/3
+        sent = len(env.hass.session.sent)
+        env.hass.data["pstryk"].clear()
+        STORE_DISK.clear()
+        _set_clock(2026, 10, 3, 9, 0)
+        client, coords = await env.build()
+        loaded = await coords["sell"].async_load_startup_cache()
+        return sent, loaded, coords["sell"].data
+
+    sent, loaded, data = _run(scenario())
+    assert loaded is True
+    assert len(env.hass.session.sent) == sent  # no request at start-up
+    assert len(data["prices_today"]) == 24
+    assert all(p["start"].startswith("2026-10-03") for p in data["prices_today"])
+
+
+def test_review2_p5_button_explains_a_429_block(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        env.hass.session.statuses = [429]
+        env.hass.session.headers = {"Retry-After": "3600"}
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        for c in coords.values():
+            c._has_tomorrow = False
+        _set_clock(2026, 10, 2, 12, 10)
+        poll = await poller.async_check()
+        button = mods.button.PstrykRefreshPricesButton("e")
+        button.hass = env.hass
+        _set_clock(2026, 10, 2, 12, 15)
+        await button.async_press()
+        return poll
+
+    assert _run(scenario()) == "failed"
+    assert len(env.hass.session.sent) == 1  # the press sent nothing
+    assert "13:10" in NOTIFICATIONS["pstryk_refresh_budget"]
+

@@ -12,7 +12,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .const import API_TIMEOUT, API_HOURLY_LIMIT, DOMAIN, REQUEST_LOG_STORE_VERSION
+from .const import API_TIMEOUT, API_URL, API_HOURLY_LIMIT, DOMAIN, PRICING_ENDPOINT, REQUEST_LOG_STORE_VERSION
 from .request_budget import RequestBudget
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,15 +30,85 @@ class BudgetExhausted(UpdateFailed):
         )
 
 
+class SharedRequestLog:
+    """The request history for the whole Home Assistant instance, kept in .storage.
+
+    Every client generation (a reload replaces the client while old requests may
+    still be running) and the config flow's API-key check count against this one
+    object, so they can never hold separate copies of the history.
+    """
+
+    def __init__(self, hass: HomeAssistant):
+        self._store = Store(hass, REQUEST_LOG_STORE_VERSION, f"{DOMAIN}_request_log")
+        self._budgets: Dict[str, RequestBudget] = {}
+        self._loaded = False
+        self._load_lock = asyncio.Lock()
+
+    async def async_load(self) -> None:
+        async with self._load_lock:
+            if self._loaded:
+                return
+            data = await self._store.async_load() or {}
+            for endpoint_key, value in data.items():
+                self._budgets[endpoint_key] = RequestBudget.from_dict(value, API_HOURLY_LIMIT)
+            self._loaded = True
+            _LOGGER.debug("Loaded API request log: %s", {
+                key: budget.used(dt_util.utcnow()) for key, budget in self._budgets.items()
+            })
+
+    def budget(self, endpoint_key: str) -> RequestBudget:
+        if endpoint_key not in self._budgets:
+            self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT)
+        return self._budgets[endpoint_key]
+
+    async def async_save(self) -> None:
+        now = dt_util.utcnow()
+        try:
+            await self._store.async_save({key: b.to_dict(now) for key, b in self._budgets.items()})
+        except Exception as err:
+            _LOGGER.warning("Failed to save the API request log: %s", err)
+
+
+REQUEST_LOG_KEY = "request_log"
+
+
+async def async_get_request_log(hass: HomeAssistant) -> SharedRequestLog:
+    data = hass.data.setdefault(DOMAIN, {})
+    request_log = data.get(REQUEST_LOG_KEY)
+    if request_log is None:
+        request_log = data[REQUEST_LOG_KEY] = SharedRequestLog(hass)
+    await request_log.async_load()
+    return request_log
+
+
+async def async_validate_api_key(hass: HomeAssistant, api_key: str) -> bool | None:
+    """One pricing request to check the key, counted in the shared log. None if there is no room."""
+    now = dt_util.utcnow()
+    url = API_URL + PRICING_ENDPOINT.format(
+        start=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end=(now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    request_log = await async_get_request_log(hass)
+    if not request_log.budget("unified-metrics").claim(dt_util.utcnow()):
+        return None
+    await request_log.async_save()
+    try:
+        session = async_get_clientsession(hass)
+        async with asyncio.timeout(API_TIMEOUT):
+            resp = await session.get(url, headers={"Authorization": api_key, "Accept": "application/json"})
+            return resp.status == 200
+    except (Exception, asyncio.TimeoutError):
+        return False
+
+
 class PstrykAPIClient:
 
-    def __init__(self, hass: HomeAssistant, api_key: str, entry_id: str | None = None):
+    def __init__(self, hass: HomeAssistant, api_key: str):
         self.hass = hass
         self.api_key = api_key
 
-        # Every HTTP attempt is counted per endpoint, and the log survives restarts.
-        self._budgets: Dict[str, RequestBudget] = {}
-        self._store = Store(hass, REQUEST_LOG_STORE_VERSION, f"{DOMAIN}_request_log_{entry_id or 'default'}")
+        # Every HTTP attempt is counted in the instance-wide request log.
+        self._request_log: Optional[SharedRequestLog] = None
         self._session: Optional[aiohttp.ClientSession] = None
 
         self._rate_limits: Dict[str, Dict[str, Any]] = {}
@@ -61,24 +131,13 @@ class PstrykAPIClient:
         return "unknown"
 
     def _budget(self, endpoint_key: str) -> RequestBudget:
-        if endpoint_key not in self._budgets:
-            self._budgets[endpoint_key] = RequestBudget(API_HOURLY_LIMIT)
-        return self._budgets[endpoint_key]
+        return self._request_log.budget(endpoint_key)
 
     async def async_load_budget(self) -> None:
-        data = await self._store.async_load() or {}
-        for endpoint_key, value in data.items():
-            self._budgets[endpoint_key] = RequestBudget.from_dict(value, API_HOURLY_LIMIT)
-        _LOGGER.debug("Loaded API request log: %s", {
-            key: budget.used(dt_util.utcnow()) for key, budget in self._budgets.items()
-        })
+        self._request_log = await async_get_request_log(self.hass)
 
     async def _save_budget(self) -> None:
-        now = dt_util.utcnow()
-        try:
-            await self._store.async_save({key: b.to_dict(now) for key, b in self._budgets.items()})
-        except Exception as err:
-            _LOGGER.warning("Failed to save the API request log: %s", err)
+        await self._request_log.async_save()
 
     def budget_has_room(self, endpoint_key: str = "unified-metrics", keep_free: int = 0) -> bool:
         return self._budget(endpoint_key).has_room(dt_util.utcnow(), keep_free)
@@ -147,6 +206,8 @@ class PstrykAPIClient:
     ) -> Dict[str, Any]:
 
         endpoint_key = self._get_endpoint_key(url)
+        if self._request_log is None:
+            await self.async_load_budget()
 
         wait_time = await self._check_rate_limit(endpoint_key)
         if wait_time and wait_time > 0:
@@ -156,9 +217,8 @@ class PstrykAPIClient:
                 )
                 await asyncio.sleep(wait_time)
             else:
-                raise UpdateFailed(
-                    f"API rate limited for {endpoint_key}. Please try again in {int(wait_time/60)} minutes."
-                )
+                # A known 429 block: nothing is sent, and callers learn when it ends.
+                raise BudgetExhausted(endpoint_key, dt_util.utcnow() + timedelta(seconds=wait_time))
 
         headers = {
             "Authorization": self.api_key,

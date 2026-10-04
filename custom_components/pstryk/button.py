@@ -55,8 +55,8 @@ class PstrykRefreshPricesButton(ButtonEntity):
             free_at = budget_free_at(self.hass, self.entry_id)
             persistent_notification.async_create(
                 self.hass,
-                "Pstryk allows 3 API requests per hour and this hour's are used. "
-                f"Prices were not refreshed. Next free slot: "
+                "Prices were not refreshed: Pstryk allows 3 API requests per hour, and this hour's "
+                "are used or Pstryk asked us to wait. Next free slot: "
                 f"{dt_util.as_local(free_at).strftime('%H:%M') if free_at else 'unknown'}.",
                 title="Pstryk: refresh not sent",
                 notification_id=f"{DOMAIN}_refresh_budget",

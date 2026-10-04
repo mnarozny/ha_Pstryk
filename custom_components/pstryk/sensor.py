@@ -11,7 +11,6 @@ from .update_coordinator import PstrykDataUpdateCoordinator, is_likely_placehold
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
 from .tomorrow_poll import PstrykTomorrowPoller
-from .price_policy import startup_fetch_needed
 from .const import (
     DOMAIN,
     CONF_MQTT_48H_MODE,
@@ -63,7 +62,7 @@ async def async_setup_entry(
 
     api_client_key = f"{entry.entry_id}_api_client"
     if api_client_key not in hass.data[DOMAIN]:
-        api_client = PstrykAPIClient(hass, api_key, entry.entry_id)
+        api_client = PstrykAPIClient(hass, api_key)
         await api_client.async_load_budget()
         hass.data[DOMAIN][api_client_key] = api_client
     else:
@@ -98,21 +97,11 @@ async def async_setup_entry(
 
     async def safe_initial_fetch(coord, coord_type):
         # Cache first: a restart spends no API request while the cache holds
-        # today's prices (and tomorrow's, once they are due after 12:05).
-        cached = await coord._load_cache()
-        if cached is not None:
-            now = dt_util.now()
-            today = now.strftime("%Y-%m-%d")
-            today_hours = sum(1 for p in cached.get("prices", []) if p.get("start", "").startswith(today))
-            has_tomorrow = coord._check_has_valid_tomorrow(cached)
-            cached["is_cached"] = True
-            coord.data = cached
-            coord._has_tomorrow = has_tomorrow
-            if not startup_fetch_needed(today_hours, has_tomorrow, now):
-                coord.last_update_success = True
-                _LOGGER.info("%s prices loaded from cache (tomorrow: %s), no API request",
-                             coord_type, has_tomorrow)
-                return True
+        # today's published prices (and tomorrow's, once they are due after 12:05).
+        if await coord.async_load_startup_cache():
+            _LOGGER.info("%s prices loaded from cache (tomorrow: %s), no API request",
+                         coord_type, coord._has_tomorrow)
+            return True
         try:
             data = await coord._async_update_data()
             coord.data = data
