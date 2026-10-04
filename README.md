@@ -90,7 +90,7 @@ Integracja korzysta  z nowego endpointu `unified-metrics`
 
 ### Limit API i harmonogram pobierania
 
-Pstryk pozwala na 3 zapytania na godzinę na endpoint ([regulamin API](https://pstryk.pl/regulaminy?doc=regulamin-api)). Ceny i koszty korzystają z tego samego endpointu `unified-metrics`, więc integracja liczy każde wysłane zapytanie (także ponowienia i sprawdzenie klucza API przy konfiguracji) w jednym limicie z ostatnich 60 minut. Gdy limit jest wykorzystany, zapytanie nie jest wysyłane. Historia zapytań jest zapisywana, więc restart Home Assistanta jej nie zeruje.
+Pstryk pozwala na 3 zapytania na godzinę na endpoint ([regulamin API](https://pstryk.pl/regulaminy?doc=regulamin-api)). Ceny i koszty korzystają z tego samego endpointu `unified-metrics`, więc integracja liczy każde wysłane zapytanie (także ponowienia i sprawdzenie klucza API przy konfiguracji) w jednym limicie z ostatnich 60 minut. Gdy limit jest wykorzystany, zapytanie nie jest wysyłane. Historia zapytań jest zapisywana, więc restart Home Assistanta jej nie zeruje. Wyjątek: po nagłym zatrzymaniu Home Assistanta (awaria, zanik zasilania) tuż po wysłaniu zapytania zapisany czas może być o kilka sekund wcześniejszy od rzeczywistego, więc na granicy godziny może wyjść czwarte zapytanie.
 
 - **Ceny mają pierwszeństwo.** Pobranie cen może użyć każdego wolnego zapytania. Przy wykorzystanym limicie sensory cen zostają przy dotychczasowych danych, a pobranie rusza, gdy zwolni się miejsce.
 - **Ceny na jutro** są sprawdzane o 12:10, 12:30, 12:50 i dalej co 20 minut, aż się pojawią. Jedno sprawdzenie to jedno zapytanie dla kupna i sprzedaży, bez ponowień. Działa to w każdym trybie i zastępuje sprawdzanie między 14:00 a 15:00.
