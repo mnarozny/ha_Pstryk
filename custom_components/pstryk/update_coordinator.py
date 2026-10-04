@@ -264,6 +264,8 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                 "prices_today": prices_today,
                 "prices": prices,
                 "is_cached": False,
+                # When these prices were fetched; kept in the cache across restarts.
+                "last_updated": dt_util.now().isoformat(),
             }
 
             self._has_tomorrow = self._check_has_valid_tomorrow(new_data)

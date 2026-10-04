@@ -1,8 +1,8 @@
-"""API budget, price refresh, button and website check, with stand-ins for Home Assistant.
+"""API budget, price refresh, button, tomorrow checks and cost, with stand-ins for Home Assistant.
 
 Home Assistant is not installed here, so the HA names these modules import are
 replaced by small stubs (as in tests/test_json_entries.py on the price-components
-branch). The real API client, coordinators, refresh, button and watcher run
+branch). The real API client, coordinators, refresh, button, poller and sensor run
 against a fake HTTP session that records when each request is sent.
 
 The clock is local Europe/Warsaw. The fixture was fetched on 2026-10-02 at 12:05,
@@ -145,7 +145,7 @@ def _stubs():
             "homeassistant.components.sensor",
             SensorEntity=type("SensorEntity", (), {}),
             SensorStateClass=types.SimpleNamespace(MEASUREMENT="measurement", TOTAL="total"),
-            SensorDeviceClass=types.SimpleNamespace(MONETARY="monetary"),
+            SensorDeviceClass=types.SimpleNamespace(MONETARY="monetary", TIMESTAMP="timestamp"),
         ),
         "homeassistant.loader": _stub("homeassistant.loader", async_get_integration=None),
         "aiohttp": aiohttp,
@@ -164,7 +164,8 @@ def mods():
             uc=importlib.import_module("pstryk.update_coordinator"),
             cost=importlib.import_module("pstryk.energy_cost_coordinator"),
             refresh=importlib.import_module("pstryk.price_refresh"),
-            watch=importlib.import_module("pstryk.web_watch"),
+            poll=importlib.import_module("pstryk.tomorrow_poll"),
+            sensor=importlib.import_module("pstryk.sensor"),
             button=importlib.import_module("pstryk.button"),
         )
     finally:
@@ -341,23 +342,24 @@ def test_cost_runs_only_on_leftover_budget(mods, env):
     async def scenario():
         client, coords = await env.build()
         cost = mods.cost.PstrykCostDataUpdateCoordinator(env.hass, client, 5, 30)
+        cost.price_coordinators = list(coords.values())
         cost.schedule_hourly_update = lambda: None
         _set_clock(2026, 10, 2, 12, 50)
-        await cost._handle_hourly_update(None)  # price hours: skipped
+        await cost._handle_hourly_update(None)  # tomorrow missing: prices first
         at_1250 = len(env.hass.session.sent)
+        _set_clock(2026, 10, 2, 13, 0)
+        price = await mods.refresh.async_refresh_prices(env.hass, "e", "tomorrow check")
         _set_clock(2026, 10, 2, 15, 50)
-        await cost._handle_hourly_update(None)  # empty budget: daily + yearly
+        await cost._handle_hourly_update(None)  # tomorrow cached: daily + yearly
         at_1550 = len(env.hass.session.sent)
         _set_clock(2026, 10, 2, 16, 20)
         await cost._handle_hourly_update(None)  # 2 used: the last slot stays for prices
         at_1620 = len(env.hass.session.sent)
-        price = await mods.refresh.async_refresh_prices(env.hass, "e", "after cost")
-        return at_1250, at_1550, at_1620, price
+        return at_1250, price, at_1550, at_1620
 
-    at_1250, at_1550, at_1620, price = _run(scenario())
-    assert (at_1250, at_1550, at_1620) == (0, 2, 2)
-    assert price == "found"
-    assert env.hass.session.max_in_any_hour() == 3
+    at_1250, price, at_1550, at_1620 = _run(scenario())
+    assert (at_1250, price, at_1550, at_1620) == (0, "found", 3, 3)
+    assert env.hass.session.max_in_any_hour() <= 3
 
 
 def test_button_reports_a_full_budget(mods, env):
@@ -376,28 +378,62 @@ def test_button_reports_a_full_budget(mods, env):
     assert "13:05" in NOTIFICATIONS["pstryk_refresh_budget"]
 
 
-def test_watcher_waits_for_budget_then_fetches_once(mods, env):
+def test_tomorrow_checks_until_found_within_budget(mods, env):
     async def scenario():
         client, coords = await env.build()
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
+        results = []
+        # Before publication the API answers 500 (as a stand-in for "nothing yet").
+        env.hass.session.statuses = [500, 500, 500]
+        for minute in (10, 30, 50):
+            _set_clock(2026, 10, 2, 12, minute)
+            results.append(await poller.async_check())
+        for minute in (10, 30):
+            _set_clock(2026, 10, 2, 13, minute)
+            results.append(await poller.async_check())
+        return results
+
+    results = _run(scenario())
+    assert results == ["failed", "failed", "failed", "found", "found"]
+    assert len(env.hass.session.sent) == 4  # one per check, no retries; none after found
+    assert env.hass.session.max_in_any_hour() == 3
+
+
+def test_tomorrow_check_waits_on_a_full_budget(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        _set_clock(2026, 10, 2, 11, 55)
         await _two_more_calls(client)
         await client.fetch(
             "https://api.pstryk.pl/integrations/meter-data/unified-metrics/?metrics=cost", max_retries=1
         )
-        watcher = mods.watch.PstrykWebSignalWatcher(env.hass, "e", "test")
-
-        async def published():
-            return True
-
-        watcher._fetch_signal = published
+        poller = mods.poll.PstrykTomorrowPoller(env.hass, "e")
         _set_clock(2026, 10, 2, 12, 10)
-        await watcher._check()
-        waiting = watcher._done_date
-        _set_clock(2026, 10, 2, 13, 10)
-        await watcher._check()
-        return waiting, watcher._done_date
+        first = await poller.async_check()
+        _set_clock(2026, 10, 2, 12, 55, 1)
+        second = await poller.async_check()
+        return first, second
 
-    waiting, done = _run(scenario())
-    assert waiting is None  # budget full: not given up
-    assert done == datetime(2026, 10, 2, tzinfo=TZ).date()
+    assert _run(scenario()) == ("budget", "found")
     assert len(env.hass.session.sent) == 4
     assert env.hass.session.max_in_any_hour() == 3
+
+
+def test_prices_fetched_sensor_shows_the_fetch_time(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        sensor = mods.sensor.PstrykPricesFetchedSensor(coords["buy"], "e")
+        sensor.coordinator = coords["buy"]
+        before = sensor.native_value
+        _set_clock(2026, 10, 2, 12, 7, 30)
+        await coords["buy"].async_request_refresh()
+        fetched = sensor.native_value
+        _set_clock(2026, 10, 2, 13, 0)
+        coords["buy"].data = {**coords["buy"].data, "is_cached": True}  # hourly tick from cache
+        return before, fetched, sensor.native_value, sensor.extra_state_attributes
+
+    before, fetched, later, attrs = _run(scenario())
+    assert before is None
+    assert fetched == datetime(2026, 10, 2, 12, 7, 30, tzinfo=TZ)
+    assert later == fetched
+    assert attrs == {"tomorrow_available": True}

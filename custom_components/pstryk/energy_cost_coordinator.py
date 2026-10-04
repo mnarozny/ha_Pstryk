@@ -23,6 +23,8 @@ class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
         self.api_client = api_client
         self._unsub_hourly = None
         self._unsub_midnight = None
+        # Set by sensor.py: cost waits until these have tomorrow's prices.
+        self.price_coordinators = []
 
         if retry_attempts is None:
             retry_attempts = DEFAULT_RETRY_ATTEMPTS
@@ -304,8 +306,9 @@ class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _handle_hourly_update(self, now):
         local_now = dt_util.now()
-        if not cost_run_allowed(local_now):
-            _LOGGER.debug("Skipping cost update at %s: price hours", local_now.strftime("%H:%M"))
+        tomorrow = all(c._has_tomorrow for c in self.price_coordinators)
+        if not cost_run_allowed(local_now, tomorrow):
+            _LOGGER.debug("Skipping cost update at %s: prices first", local_now.strftime("%H:%M"))
             self.schedule_hourly_update()
             return
         if not self.api_client.budget_has_room(keep_free=COST_KEEP_FREE):

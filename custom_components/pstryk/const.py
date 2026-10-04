@@ -27,8 +27,6 @@ CONF_MQTT_TOPIC_BUY = "mqtt_topic_buy"
 CONF_MQTT_TOPIC_SELL = "mqtt_topic_sell"
 CONF_MQTT_48H_MODE = "mqtt_48h_mode"
 CONF_JSON_SENSOR = "json_sensor_enabled"
-CONF_WEB_SIGNAL = "web_signal_experimental"
-WEB_SIGNAL_URL = "https://pstryk.pl/ceny"
 
 CONF_RETRY_ATTEMPTS = "retry_attempts"
 CONF_RETRY_DELAY = "retry_delay"

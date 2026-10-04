@@ -1,6 +1,6 @@
 """Tests for price_policy.py, loaded by path so Home Assistant is not needed."""
 import importlib.util
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -49,6 +49,42 @@ def test_next_cost_run(now, expected):
     assert price_policy.next_cost_run(now) == expected
 
 
-def test_cost_skips_the_price_hours():
-    allowed = [h for h in range(24) if price_policy.cost_run_allowed(_local(2026, 10, 4, h, 50))]
-    assert [h for h in range(24) if h not in allowed] == [11, 12, 13, 23]
+def test_cost_waits_for_tomorrows_prices():
+    def skipped(has_tomorrow):
+        return [h for h in range(24) if not price_policy.cost_run_allowed(_local(2026, 10, 4, h, 50), has_tomorrow)]
+
+    assert skipped(True) == [11, 23]
+    assert skipped(False) == [11] + list(range(12, 24))
+
+
+@pytest.mark.parametrize(
+    "now, expected",
+    [
+        (_local(2026, 10, 4, 0, 1), _local(2026, 10, 4, 12, 10)),
+        (_local(2026, 10, 4, 12, 0, 4), _local(2026, 10, 4, 12, 10)),
+        (_local(2026, 10, 4, 12, 10, 0, 5000), _local(2026, 10, 4, 12, 30)),
+        (_local(2026, 10, 4, 12, 31), _local(2026, 10, 4, 12, 50)),
+        (_local(2026, 10, 4, 12, 50, 1), _local(2026, 10, 4, 13, 10)),
+        (_local(2026, 10, 4, 23, 30, 1), _local(2026, 10, 4, 23, 50)),
+        (_local(2026, 10, 4, 23, 50, 1), _local(2026, 10, 5, 12, 10)),
+    ],
+)
+def test_next_tomorrow_check(now, expected):
+    assert price_policy.next_tomorrow_check(now) == expected
+
+
+def test_tomorrow_checks_fit_the_hourly_budget():
+    checks, now = [], _local(2026, 10, 4, 0, 1)
+    while True:
+        now = price_policy.next_tomorrow_check(now)
+        if now.day != 4:
+            break
+        checks.append(now)
+    assert checks[:3] == [_local(2026, 10, 4, 12, m) for m in (10, 30, 50)]
+    assert max(sum(1 for c in checks if s <= c < s + timedelta(hours=1)) for s in checks) == 3
+
+
+def test_dst_change_keeps_local_check_times():
+    nxt = price_policy.next_tomorrow_check(_local(2026, 10, 24, 23, 55))
+    assert (nxt.day, nxt.hour, nxt.minute) == (25, 12, 10)
+    assert nxt.utcoffset().total_seconds() == 3600

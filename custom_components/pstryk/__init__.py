@@ -125,9 +125,9 @@ async def _cleanup_coordinators(hass: HomeAssistant, entry: ConfigEntry) -> None
         mqtt_publisher.unsubscribe()
         hass.data[DOMAIN].pop(f"{entry.entry_id}_mqtt", None)
     
-    web_watch = hass.data[DOMAIN].pop(f"{entry.entry_id}_web_watch", None)
-    if web_watch:
-        web_watch.stop()
+    tomorrow_poll = hass.data[DOMAIN].pop(f"{entry.entry_id}_tomorrow_poll", None)
+    if tomorrow_poll:
+        tomorrow_poll.stop()
 
     for price_type in ("buy", "sell"):
         key = f"{entry.entry_id}_{price_type}"
