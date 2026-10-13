@@ -674,6 +674,69 @@ def test_review3_cost_runs_every_hour(mods, env):
     assert env.hass.session.max_in_any_hour() <= 3
 
 
+def _new_cost(mods, env, client, coords):
+    cost = mods.cost.PstrykCostDataUpdateCoordinator(env.hass, client, 1, 30)
+    cost.price_coordinators = list(coords.values())
+    cost.schedule_hourly_update = lambda: None
+    cost.last_update_success = False  # as sensor.py sets it before restoring
+    return cost
+
+
+def test_cost_data_survives_a_restart_without_a_request(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # 12:05, tomorrow cached
+        cost = _new_cost(mods, env, client, coords)
+        _set_clock(2026, 10, 2, 13, 50)
+        await cost._handle_hourly_update(None)  # daily + yearly
+        full = copy.deepcopy(cost.data)
+        _set_clock(2026, 10, 2, 14, 30)
+        await client.fetch(  # another call leaves room for daily only at 14:50
+            "https://api.pstryk.pl/integrations/meter-data/unified-metrics/?metrics=cost", max_retries=1
+        )
+        _set_clock(2026, 10, 2, 14, 50)
+        await cost._handle_hourly_update(None)
+        at_1450 = len(env.hass.session.sent)
+        env.hass.data["pstryk"].clear()
+        _set_clock(2026, 10, 2, 15, 0)
+        client, coords = await env.build()  # restart
+        restarted = _new_cost(mods, env, client, coords)
+        await restarted.async_restore()
+        return full, at_1450, restarted
+
+    full, at_1450, restarted = _run(scenario())
+    assert sorted(full) == ["daily", "monthly", "yearly"]
+    assert at_1450 == 5  # prices (one for both), 2 at 13:50, the other call, daily only at 14:50
+    assert len(env.hass.session.sent) == at_1450  # restoring sent nothing
+    assert restarted.last_update_success is True
+    assert restarted.data == full  # monthly and yearly from 13:50 kept through the partial run
+
+
+@pytest.mark.parametrize("now, periods", [
+    ((2026, 10, 2, 23, 59), ["daily", "monthly", "yearly"]),
+    ((2026, 10, 3, 0, 5), ["monthly", "yearly"]),
+    ((2026, 11, 1, 0, 5), ["yearly"]),
+    ((2027, 1, 1, 0, 5), []),
+])
+def test_restored_cost_data_stays_within_its_period(mods, env, now, periods):
+    # Fetched 2026-10-02 13:50 local (11:50Z); periods end at local midnight.
+    entry = {"fetched": "2026-10-02T11:50:00+00:00", "data": {"total_balance": 1.0}}
+    saved = {period: entry for period in ("daily", "monthly", "yearly")}
+    assert sorted(mods.cost.restorable_periods(saved, datetime(*now, tzinfo=TZ))) == periods
+
+
+def test_nothing_saved_leaves_cost_unavailable(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        cost = _new_cost(mods, env, client, coords)
+        await cost.async_restore()
+        return cost
+
+    cost = _run(scenario())
+    assert cost.data is None
+    assert cost.last_update_success is False
+
+
 def test_a_slot_further_away_is_not_waited_for(mods, env):
     async def scenario():
         client, coords = await env.build()

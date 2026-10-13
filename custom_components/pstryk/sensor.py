@@ -91,6 +91,7 @@ async def async_setup_entry(
         retry_delay
     )
     cost_coordinator.last_update_success = False
+    await cost_coordinator.async_restore()
     coordinators.append((cost_coordinator, "cost", cost_key))
 
     _LOGGER.info("Starting quick initialization - loading price coordinators only")
