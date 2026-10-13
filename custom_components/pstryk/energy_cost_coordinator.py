@@ -38,8 +38,9 @@ def restorable_periods(saved, now):
 
 class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
 
-    def __init__(self, hass: HomeAssistant, api_client: PstrykAPIClient, retry_attempts=None, retry_delay=None):
+    def __init__(self, hass: HomeAssistant, api_client: PstrykAPIClient, retry_attempts=None, retry_delay=None, entry_id=None):
         self.api_client = api_client
+        self.entry_id = entry_id
         self._unsub_hourly = None
         self._unsub_midnight = None
         # Set by sensor.py: cost waits until these have tomorrow's prices.
@@ -319,6 +320,11 @@ class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.warning("Failed to load saved cost data: %s", err)
             self._saved = {}
+        # Like the price cache: the store outlives its entry, and an entry added
+        # later may belong to another account.
+        if self._saved and self._saved.get("owner") != self.entry_id:
+            _LOGGER.info("Saved cost data was written by another entry; not using it")
+            self._saved = {}
         restored = restorable_periods(self._saved, dt_util.now())
         if restored:
             self.data = restored
@@ -327,6 +333,7 @@ class PstrykCostDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_save(self, data):
         fetched = dt_util.utcnow().isoformat()
+        self._saved["owner"] = self.entry_id
         for period, period_data in data.items():
             self._saved[period] = {"fetched": fetched, "data": period_data}
         try:
