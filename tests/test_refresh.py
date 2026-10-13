@@ -61,6 +61,9 @@ class _Coordinator:
     def async_update_listeners(self):
         pass
 
+    def async_add_listener(self, listener):
+        return lambda: None
+
     def async_set_updated_data(self, data):
         self.data, self.last_update_success = data, True
 
@@ -88,6 +91,25 @@ class _Store:
 
     def async_delay_save(self, data_func, delay=0):
         STORE_DISK[self.key] = copy.deepcopy(data_func())
+
+
+class _RestoreEntity:
+    """What PstrykAveragePriceSensor uses of an entity; `last_state` is set by the test."""
+
+    last_state = None
+    writes = 0
+
+    async def async_added_to_hass(self):
+        pass
+
+    async def async_get_last_state(self):
+        return self.last_state
+
+    def async_on_remove(self, func):
+        pass
+
+    def async_write_ha_state(self):
+        self.writes += 1
 
 
 def _track(hass, callback, when):
@@ -137,7 +159,7 @@ def _stubs():
         "homeassistant.helpers.event": _stub("homeassistant.helpers.event", async_track_point_in_time=_track),
         "homeassistant.helpers.storage": _stub("homeassistant.helpers.storage", Store=_Store),
         "homeassistant.helpers.restore_state": _stub(
-            "homeassistant.helpers.restore_state", RestoreEntity=type("RestoreEntity", (), {})
+            "homeassistant.helpers.restore_state", RestoreEntity=_RestoreEntity
         ),
         "homeassistant.helpers.aiohttp_client": _stub(
             "homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda hass: hass.session
@@ -221,11 +243,28 @@ class _Session:
         self.headers = {}
         self.pricing = PRICING
         self.gate = None  # an asyncio.Event holds responses until set
+        self.cost_frames = False  # True: cost answers carry one frame valued by request number
+
+    def _cost(self, url):
+        if not self.cost_frames:
+            return {"frames": []}
+        n = len(self.sent)
+        day = CLOCK[0].replace(hour=0, minute=0, second=0, microsecond=0)
+        start = day if "resolution=day" in url else day.replace(day=1)
+        return {"frames": [{
+            "start": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "is_live": True,
+            "energy_balance_value": n,
+            "energy_sold_value": n,
+            "fae_cost": 2 * n,
+            "fae_usage": n,
+            "rae": n,
+        }]}
 
     def get(self, url, headers=None):
         self.sent.append(CLOCK[0])
         status = self.statuses.pop(0) if self.statuses else 200
-        body = self.pricing if "metrics=pricing" in url else {"frames": []}
+        body = self.pricing if "metrics=pricing" in url else self._cost(url)
         return _Response(status, body, self.headers if status == 429 else None, self.gate)
 
     def max_in_any_hour(self):
@@ -672,6 +711,110 @@ def test_review3_cost_runs_every_hour(mods, env):
 
     assert _run(scenario()) == [(2, ["daily", "monthly", "yearly"])] * 10
     assert env.hass.session.max_in_any_hour() <= 3
+
+
+def _new_cost(mods, env, client, coords, entry_id="e"):
+    cost = mods.cost.PstrykCostDataUpdateCoordinator(env.hass, client, 1, 30, entry_id)
+    cost.price_coordinators = list(coords.values())
+    cost.schedule_hourly_update = lambda: None
+    cost.last_update_success = False  # as sensor.py sets it before restoring
+    return cost
+
+
+async def _cost_runs_then_restart(mods, env, restart_at, entry_id="e"):
+    """Full run at 13:50 on Oct 2, daily only at 14:50, then a restart at `restart_at`.
+
+    Cost frames carry their request number: 12:05 prices is 1, 13:50 daily 2 and
+    yearly 3, the other call at 14:30 is 4, 14:50 daily 5.
+    """
+    env.hass.session.cost_frames = True
+    client, coords = await env.build()
+    await asyncio.gather(*(c.async_request_refresh() for c in coords.values()))  # 12:05, tomorrow cached
+    cost = _new_cost(mods, env, client, coords)
+    _set_clock(2026, 10, 2, 13, 50)
+    await cost._handle_hourly_update(None)  # daily + yearly
+    full = copy.deepcopy(cost.data)
+    _set_clock(2026, 10, 2, 14, 30)
+    await client.fetch(  # another call leaves room for daily only at 14:50
+        "https://api.pstryk.pl/integrations/meter-data/unified-metrics/?metrics=cost", max_retries=1
+    )
+    _set_clock(2026, 10, 2, 14, 50)
+    await cost._handle_hourly_update(None)
+    sent = len(env.hass.session.sent)
+    env.hass.data["pstryk"].clear()
+    _set_clock(*restart_at)
+    client, coords = await env.build()  # restart
+    restarted = _new_cost(mods, env, client, coords, entry_id)
+    await restarted.async_restore()
+    return full, sent, restarted, coords
+
+
+def test_cost_data_survives_a_restart_without_a_request(mods, env):
+    full, sent, restarted, _ = _run(_cost_runs_then_restart(mods, env, (2026, 10, 2, 15, 0)))
+    assert sorted(full) == ["daily", "monthly", "yearly"]
+    assert full["monthly"]["total_balance"] == 3
+    assert sent == 5  # the yearly call at 14:50 was refused
+    assert len(env.hass.session.sent) == sent  # restoring sent nothing
+    assert restarted.last_update_success is True
+    assert restarted.data["daily"]["total_balance"] == 5  # from 14:50
+    assert restarted.data["monthly"] == full["monthly"]  # from 13:50, kept through the partial run
+    assert restarted.data["yearly"] == full["yearly"]
+
+
+def test_cost_data_of_another_entry_is_not_restored(mods, env):
+    _, _, restarted, _ = _run(_cost_runs_then_restart(mods, env, (2026, 10, 2, 15, 0), entry_id="other"))
+    assert restarted.data is None
+    assert restarted.last_update_success is False
+
+
+def _average(mods, cost, coords, period, last_state=None):
+    sensor = mods.sensor.PstrykAveragePriceSensor(cost, coords["buy"], period, "e")
+    sensor.last_state = last_state
+    _run(sensor.async_added_to_hass())
+    return sensor
+
+
+def test_averages_after_midnight_use_only_their_own_period(mods, env):
+    _, _, restarted, coords = _run(_cost_runs_then_restart(mods, env, (2026, 10, 3, 0, 5)))
+    yesterday = types.SimpleNamespace(state="1.5", attributes={})
+    daily = _average(mods, restarted, coords, "daily", yesterday)
+    monthly = _average(mods, restarted, coords, "monthly", yesterday)
+    assert sorted(restarted.data) == ["monthly", "yearly"]
+    assert daily.available is False  # yesterday's 1.5 is not shown as today's
+    assert monthly.available is True
+    assert monthly.native_value == 2.0  # from the restored month, not the entity's 1.5
+
+
+def test_averages_without_entity_state_come_from_restored_cost(mods, env):
+    _, _, restarted, coords = _run(_cost_runs_then_restart(mods, env, (2026, 10, 2, 15, 0)))
+    daily = _average(mods, restarted, coords, "daily")
+    assert daily.available is True
+    assert daily.native_value == 2.0
+
+
+@pytest.mark.parametrize("now, periods", [
+    ((2026, 10, 2, 23, 59), ["daily", "monthly", "yearly"]),
+    ((2026, 10, 3, 0, 5), ["monthly", "yearly"]),
+    ((2026, 11, 1, 0, 5), ["yearly"]),
+    ((2027, 1, 1, 0, 5), []),
+])
+def test_restored_cost_data_stays_within_its_period(mods, env, now, periods):
+    # Fetched 2026-10-02 13:50 local (11:50Z); periods end at local midnight.
+    entry = {"fetched": "2026-10-02T11:50:00+00:00", "data": {"total_balance": 1.0}}
+    saved = {period: entry for period in ("daily", "monthly", "yearly")}
+    assert sorted(mods.cost.restorable_periods(saved, datetime(*now, tzinfo=TZ))) == periods
+
+
+def test_nothing_saved_leaves_cost_unavailable(mods, env):
+    async def scenario():
+        client, coords = await env.build()
+        cost = _new_cost(mods, env, client, coords)
+        await cost.async_restore()
+        return cost
+
+    cost = _run(scenario())
+    assert cost.data is None
+    assert cost.last_update_success is False
 
 
 def test_a_slot_further_away_is_not_waited_for(mods, env):

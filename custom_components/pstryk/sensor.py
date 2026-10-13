@@ -88,9 +88,11 @@ async def async_setup_entry(
         hass,
         api_client,
         retry_attempts,
-        retry_delay
+        retry_delay,
+        entry.entry_id
     )
     cost_coordinator.last_update_success = False
+    await cost_coordinator.async_restore()
     coordinators.append((cost_coordinator, "cost", cost_key))
 
     _LOGGER.info("Starting quick initialization - loading price coordinators only")
@@ -709,7 +711,10 @@ class PstrykAveragePriceSensor(RestoreEntity, SensorEntity):
                             self.price_type, self.period, self._state)
             except (ValueError, TypeError):
                 _LOGGER.warning("Could not restore state for %s", self.name)
-        
+
+        # Cost data restored at start-up is newer than the entity's own state.
+        self._update_from_cost()
+
     @property
     def name(self) -> str:
         period_name = self.period.title()
@@ -765,13 +770,19 @@ class PstrykAveragePriceSensor(RestoreEntity, SensorEntity):
         
     @callback
     def _handle_cost_update(self) -> None:
+        if self._update_from_cost():
+            self.async_write_ha_state()
+
+    def _period_data(self):
         if not self.cost_coordinator or not self.cost_coordinator.data:
-            return
-            
-        period_data = self.cost_coordinator.data.get(self.period)
+            return None
+        return self.cost_coordinator.data.get(self.period)
+
+    def _update_from_cost(self) -> bool:
+        period_data = self._period_data()
         if not period_data:
-            return
-            
+            return False
+
         if self.price_type == "buy":
             total_cost = abs(period_data.get("total_cost", 0))
             energy_bought = period_data.get("fae_usage", 0)
@@ -793,14 +804,16 @@ class PstrykAveragePriceSensor(RestoreEntity, SensorEntity):
                 self._total_revenue = total_revenue
             else:
                 self._state = None
-                
-        self.async_write_ha_state()
-        
+
+        return True
+
     @property
     def available(self) -> bool:
-        return (self.cost_coordinator is not None and 
+        # Its own period only: after midnight a restored month must not make
+        # yesterday's daily average look current.
+        return (self.cost_coordinator is not None and
                 self.cost_coordinator.last_update_success and
-                self.cost_coordinator.data is not None)
+                bool(self._period_data()))
 
 
 class PstrykFinancialBalanceSensor(CoordinatorEntity, SensorEntity):
