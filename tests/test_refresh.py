@@ -1120,3 +1120,19 @@ def test_review5_a_restart_restores_the_send_time(mods, env):
         assert sent[2] == datetime(2026, 10, 4, 12, 50, 3, 100000, tzinfo=TZ)
         assert sent[5] - sent[2] >= timedelta(hours=1, seconds=2)
         assert env.hass.session.max_in_any_hour() == 3
+
+
+def test_hourly_tick_covers_the_repeated_hour(mods, env):
+    """2026-10-25: 02:00 CEST (00:00Z) and 02:00 CET (01:00Z) each get their tick.
+
+    Computed on the local wall clock, 02:10 CEST + 1 h was 03:00 CET (02:00Z),
+    and the repeated hour had no tick. From kriskomp/ha_Pstryk 2.2.4.
+    """
+    client, coords = _run(env.build())
+    buy = coords["buy"]
+    _set_clock(2026, 10, 25, 2, 10)  # 02:10 CEST, the first pass
+    buy.schedule_hourly_update()
+    assert SCHEDULED[-1][0].astimezone(timezone.utc) == datetime(2026, 10, 25, 1, 0, 5, tzinfo=timezone.utc)
+    CLOCK[0] = datetime(2026, 10, 25, 2, 10, fold=1, tzinfo=TZ)  # 02:10 CET, the second pass
+    buy.schedule_hourly_update()
+    assert SCHEDULED[-1][0].astimezone(timezone.utc) == datetime(2026, 10, 25, 2, 0, 5, tzinfo=timezone.utc)

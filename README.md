@@ -96,6 +96,7 @@ Pstryk pozwala na 3 zapytania na godzinę na endpoint ([regulamin API](https://p
 - **Ceny na jutro** są sprawdzane o 12:10, 12:30, 12:50 i dalej co 20 minut, aż się pojawią. Jedno sprawdzenie to jedno zapytanie dla kupna i sprzedaży, bez ponowień. Działa to w każdym trybie i zastępuje sprawdzanie między 14:00 a 15:00.
 - **O 00:01** pobierane są ceny na nowy dzień.
 - **Koszty, średnie i bilans** są pobierane o :50 każdej godziny i tylko z zapytań, których nie potrzebują ceny: nie o 11:50 i 23:50, a po 12:00 dopiero wtedy, gdy ceny na jutro są już pobrane. Po restarcie te sensory są niedostępne do pierwszego takiego pobrania.
+- **Zmiana czasu:** w noc cofnięcia zegara powtórzona godzina 02:00 ma dwa wpisy, `02:00:00+02:00` i `02:00:00+01:00` (każdy `start` niesie swoje przesunięcie), a godzinna aktualizacja jest liczona w UTC, więc żadna godzina nie jest pomijana ani liczona podwójnie.
 - **Restart:** integracja wczytuje ceny z pamięci podręcznej. Jeśli są w niej dzisiejsze ceny, nie wysyła zapytania. Jeśli brakuje tylko cen na jutro (po 12:05), wysyła jedno.
 - **`button.pstryk_refresh_prices`** pobiera ceny kupna i sprzedaży jednym zapytaniem. Przy wykorzystanym limicie nic nie wysyła i pokazuje powiadomienie z godziną, o której zwolni się miejsce.
 - **`sensor.pstryk_prices_fetched`** pokazuje, kiedy ceny będące teraz w użyciu zostały pobrane z API. Atrybut `tomorrow_available` mówi, czy są już ceny na jutro.

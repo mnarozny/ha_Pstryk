@@ -52,6 +52,17 @@ def is_likely_placeholder_data(prices_for_day):
     return False
 
 
+def entry_start(entry):
+    """When a price entry starts, as a UTC datetime; None without a start.
+
+    Entries carry their UTC offset since 2.1.4.4; a naive one, from a cache
+    written by an older version, is local time. UTC, because two datetimes in
+    one zone compare by wall clock, which makes 02:00 CEST and 02:00 CET equal.
+    """
+    parsed = dt_util.parse_datetime(entry.get("start") or "")
+    return dt_util.as_utc(dt_util.as_local(parsed)) if parsed else None
+
+
 class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass, api_client: PstrykAPIClient, price_type, mqtt_48h_mode=False, retry_attempts=None, retry_delay=None, entry_id=None):
@@ -310,7 +321,11 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.warning("Invalid datetime format in frames for %s", self.price_type)
                     continue
 
-                local_start = dt_util.as_local(start).strftime("%Y-%m-%dT%H:%M:%S")
+                # Local time with its offset: on the night the clocks go back
+                # the repeated hour is 02:00+02:00 and then 02:00+01:00. Without
+                # the offset both read as the first, and the second hour had
+                # no price of its own.
+                local_start = dt_util.as_local(start).isoformat()
                 pricing = f.get("metrics", {}).get("pricing", {})
                 prices.append({
                     "start": local_start,
@@ -376,12 +391,15 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
             self._unsub_hourly()
             self._unsub_hourly = None
 
-        now = dt_util.now()
+        # In UTC: local wall-clock arithmetic on the night the clocks go back
+        # books the tick after the repeated hour and skips it (Poland's offsets
+        # are whole hours). From kriskomp/ha_Pstryk 4b5739d (2.2.4).
+        now = dt_util.utcnow()
         next_run = (now.replace(minute=0, second=0, microsecond=0)
                     + timedelta(hours=1, seconds=5))
 
         _LOGGER.debug("Scheduling next hourly update for %s at %s",
-                     self.price_type, next_run.strftime("%Y-%m-%d %H:%M:%S"))
+                     self.price_type, dt_util.as_local(next_run).strftime("%Y-%m-%d %H:%M:%S"))
 
         self._unsub_hourly = async_track_point_in_time(
             self.hass, self._handle_hourly_update, dt_util.as_utc(next_run)

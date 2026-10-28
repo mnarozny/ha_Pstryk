@@ -7,7 +7,7 @@ from homeassistant.components.sensor import SensorEntity, SensorStateClass, Sens
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
-from .update_coordinator import PstrykDataUpdateCoordinator, is_likely_placeholder_data
+from .update_coordinator import PstrykDataUpdateCoordinator, entry_start, is_likely_placeholder_data
 from .energy_cost_coordinator import PstrykCostDataUpdateCoordinator
 from .api_client import PstrykAPIClient
 from .tomorrow_poll import PstrykTomorrowPoller
@@ -353,7 +353,8 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
         if not prices:
             return 0
             
-        sorted_prices = sorted(prices, key=lambda x: x.get("start", ""))
+        # By instant: as strings, the repeated hour's +01:00 sorts before +02:00.
+        sorted_prices = sorted(prices, key=entry_start)
         
         max_consecutive = 1
         current_consecutive = 1
@@ -526,12 +527,11 @@ class PstrykPriceSensor(CoordinatorEntity, SensorEntity):
             if valid_prices_count_full > 0:
                 avg_price_full_day = round(total_price_full / valid_prices_count_full, 2)
             
-            current_hour = now.strftime("%Y-%m-%dT%H:")
-            remaining_prices = []
-            
-            for p in today:
-                if p.get("price") is not None and p.get("start", "") >= current_hour:
-                    remaining_prices.append(p.get("price"))
+            current_hour = dt_util.as_utc(now.replace(minute=0, second=0, microsecond=0))
+            remaining_prices = [
+                p["price"] for p in today
+                if p.get("price") is not None and entry_start(p) >= current_hour
+            ]
             
             remaining_hours_count = len(remaining_prices)
             if remaining_hours_count > 0:

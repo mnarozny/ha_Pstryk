@@ -11,7 +11,7 @@ import importlib
 import json
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,6 +66,7 @@ def _stubs():
         as_utc=lambda d: d.astimezone(timezone.utc),
         as_local=_as_local,
         parse_datetime=_parse_datetime,
+        start_of_local_day=lambda d: datetime(d.year, d.month, d.day, tzinfo=TZ),
         DEFAULT_TIME_ZONE=TZ,
     )
     aiohttp = _stub("aiohttp")
@@ -122,6 +123,7 @@ def mods():
             uc=importlib.import_module("pstryk.update_coordinator"),
             sensor=importlib.import_module("pstryk.sensor"),
             pc=importlib.import_module("pstryk.price_components"),
+            mqtt=importlib.import_module("pstryk.mqtt_publisher"),
         )
     finally:
         for name in [n for n in sys.modules if n == "pstryk" or n.startswith("pstryk.")]:
@@ -222,3 +224,92 @@ def test_current_price_lists_unchanged(mods, tmp_path):
     attrs = price_sensor.extra_state_attributes
     for key in ("All prices", "Best prices", "Worst prices"):
         assert all(set(p) == {"start", "price"} for p in attrs[key])
+
+
+# The night the clocks go back: 2026-10-25 has 25 local hours, 02:00 CEST and
+# then 02:00 CET. Each entry carries its offset, so the second is its own hour.
+
+UTC = timezone.utc
+DST_NOW = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)  # 02:30 CET, the repeated hour's second pass
+
+
+def _dst_frames():
+    """49 frames as the API sends them: 2026-10-25 (25 local hours) and 10-26, a distinct price per hour."""
+    first = datetime(2026, 10, 24, 22, tzinfo=UTC)
+    frames = []
+    for i in range(49):
+        start = first + timedelta(hours=i)
+        tge = round(0.3 + i / 100, 2)
+        frames.append({
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": (start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "metrics": {"pricing": {
+                "tge_price": tge, "dist_price": 0.1348, "service_price": 0.08,
+                "vat_component": 0.1, "excise_component": 0.005,
+                "price_gross": round(tge + 0.5, 2), "price_prosumer_gross": round(tge * 1.23, 2),
+                "is_cheap": False, "is_expensive": False,
+            }},
+        })
+    return {"frames": frames}
+
+
+@pytest.fixture
+def dst_clock():
+    CLOCK[0] = DST_NOW
+    yield
+    CLOCK[0] = NOW
+
+
+def _price_sensor(mods, coordinator):
+    sensor = mods.sensor.PstrykPriceSensor(coordinator, "buy", 5, 5, "entry")
+    sensor.hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda _: None))
+    return sensor
+
+
+def test_repeated_hour_keeps_both_entries(mods, tmp_path, dst_clock):
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    assert [p["start"] for p in prices[2:5]] == [
+        "2026-10-25T02:00:00+02:00", "2026-10-25T02:00:00+01:00", "2026-10-25T03:00:00+01:00",
+    ]
+    assert len(coordinator.data["prices_today"]) == 25
+    today = sensor.extra_state_attributes["prices_today"]
+    times = [e["time"] for e in today]
+    assert len(times) == 25 and len(set(times)) == 25
+    assert times[3] == datetime(2026, 10, 25, 1, tzinfo=UTC)
+    # 02:30 CET is the second pass: its own price, not 02:00 CEST's.
+    assert sensor.native_value == prices[3]["price"] != prices[2]["price"]
+
+
+def test_repeated_hour_in_the_price_sensor(mods, tmp_path, dst_clock):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    sensor = _price_sensor(mods, coordinator)
+    assert sensor.native_value == prices[3]["price"]
+    attrs = sensor.extra_state_attributes
+    assert attrs["Price count"] == 25
+    # 02:00 CET and the 22 hours after it remain; 02:00 CEST is over.
+    assert attrs["Average price today /22"] == round(sum(p["price"] for p in prices[3:25]) / 22, 2)
+
+
+def test_consecutive_values_follow_the_instant_order(mods, tmp_path):
+    coordinator, _ = _fetch(mods, tmp_path, REAL, "buy")
+    sensor = _price_sensor(mods, coordinator)
+    entries = [
+        {"start": "2026-10-25T01:00:00+02:00", "price": 0.5},
+        {"start": "2026-10-25T02:00:00+02:00", "price": 0.4},
+        {"start": "2026-10-25T02:00:00+01:00", "price": 0.5},
+    ]
+    # Sorted as strings, 02:00+01:00 would sit next to 01:00 and count as a pair.
+    assert sensor._count_consecutive_same_values(entries) == 1
+
+
+def test_mqtt_list_keeps_the_repeated_hour_in_order(mods, tmp_path, dst_clock, caplog):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    publisher = mods.mqtt.PstrykMqttPublisher(types.SimpleNamespace(data={"pstryk": {}}), "entry")
+    with caplog.at_level("WARNING"):
+        formatted = publisher._format_prices_for_evcc(coordinator.data, "buy")
+    starts = [f["start"] for f in formatted]
+    assert len(starts) == 25 and starts == sorted(starts)
+    assert starts[2:5] == ["2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z", "2026-10-25T02:00:00Z"]
+    assert "Incomplete day" not in caplog.text
