@@ -63,6 +63,35 @@ def entry_start(entry):
     return dt_util.as_utc(dt_util.as_local(parsed)) if parsed else None
 
 
+def with_offsets(data):
+    """`data` with every naive `start` (a cache written before 2.1.4.4) given its offset.
+
+    A naive local time is ambiguous in the repeated hour of a clock change.
+    The API lists frames in order and the cache keeps that order, so the second
+    of two equal naive starts is the second pass (fold=1): 02:00+01:00.
+    """
+    if not data:
+        return data
+    out = dict(data)
+    for key in ("prices", "prices_today"):
+        entries = data.get(key)
+        if not entries:
+            continue
+        seen = set()
+        rewritten = []
+        for entry in entries:
+            start = entry.get("start")
+            parsed = dt_util.parse_datetime(start) if start else None
+            if parsed is None or parsed.tzinfo is not None:
+                rewritten.append(entry)
+                continue
+            parsed = parsed.replace(fold=1 if start in seen else 0)
+            seen.add(start)
+            rewritten.append({**entry, "start": dt_util.as_local(parsed).isoformat()})
+        out[key] = rewritten
+    return out
+
+
 class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass, api_client: PstrykAPIClient, price_type, mqtt_48h_mode=False, retry_attempts=None, retry_delay=None, entry_id=None):
@@ -146,7 +175,7 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
         if cached and self.entry_id and cached.get("owner") != self.entry_id:
             _LOGGER.info("Cache for %s was written by another entry; not using it", self.price_type)
             return None
-        return cached
+        return with_offsets(cached)
 
     def _check_has_valid_tomorrow(self, data: dict) -> bool:
         now = dt_util.now()

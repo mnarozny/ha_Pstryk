@@ -233,11 +233,10 @@ UTC = timezone.utc
 DST_NOW = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)  # 02:30 CET, the repeated hour's second pass
 
 
-def _dst_frames():
-    """49 frames as the API sends them: 2026-10-25 (25 local hours) and 10-26, a distinct price per hour."""
-    first = datetime(2026, 10, 24, 22, tzinfo=UTC)
+def _dst_frames(first=datetime(2026, 10, 24, 22, tzinfo=UTC), count=49):
+    """Frames as the API sends them, a distinct price per hour: by default 2026-10-25 (25 local hours) and 10-26."""
     frames = []
-    for i in range(49):
+    for i in range(count):
         start = first + timedelta(hours=i)
         tge = round(0.3 + i / 100, 2)
         frames.append({
@@ -313,3 +312,41 @@ def test_mqtt_list_keeps_the_repeated_hour_in_order(mods, tmp_path, dst_clock, c
     assert len(starts) == 25 and starts == sorted(starts)
     assert starts[2:5] == ["2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z", "2026-10-25T02:00:00Z"]
     assert "Incomplete day" not in caplog.text
+
+
+def test_next_hour_price_at_both_clock_changes(mods, tmp_path):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    sensor = _price_sensor(mods, coordinator)
+    CLOCK[0] = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)  # 02:30 CEST: next is 02:00 CET, not 03:00
+    assert sensor._get_next_hour_price() == prices[3]["price"]
+    CLOCK[0] = DST_NOW  # 02:30 CET: next is 03:00 CET
+    assert sensor._get_next_hour_price() == prices[4]["price"]
+    # Spring forward, 2027-03-28: 02:00 CET does not exist; after 01:30 CET comes 03:00 CEST.
+    spring, _ = _fetch(mods, tmp_path, _dst_frames(datetime(2027, 3, 27, 23, tzinfo=UTC), 23), "buy")
+    CLOCK[0] = datetime(2027, 3, 28, 0, 30, tzinfo=UTC)
+    sensor = _price_sensor(mods, spring)
+    assert spring.data["prices"][2]["start"] == "2027-03-28T03:00:00+02:00"
+    assert sensor._get_next_hour_price() == spring.data["prices"][2]["price"]
+    CLOCK[0] = NOW
+
+
+def test_legacy_cache_gets_its_offsets_on_load(mods, tmp_path, dst_clock):
+    """A cache written before 2.1.4.4 (naive starts, the 02:00 twice) is read as 25 distinct hours."""
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    legacy = copy.deepcopy(coordinator.data)
+    for entry in legacy["prices"] + legacy["prices_today"]:
+        entry["start"] = entry["start"][:19]
+    legacy["last_updated"] = "2026-10-25T00:01:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+    assert asyncio.run(coordinator.async_load_startup_cache())  # today's prices: no request
+    prices = coordinator.data["prices"]
+    assert [p["start"] for p in prices[2:5]] == [
+        "2026-10-25T02:00:00+02:00", "2026-10-25T02:00:00+01:00", "2026-10-25T03:00:00+01:00",
+    ]
+    assert prices[3]["price"] != prices[2]["price"]
+    assert sensor.native_value == prices[3]["price"]
+    price_sensor = _price_sensor(mods, coordinator)
+    assert price_sensor.native_value == prices[3]["price"]
+    assert all("+0" in p["start"] for p in price_sensor.extra_state_attributes["Best prices"])
