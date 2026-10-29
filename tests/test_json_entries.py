@@ -230,7 +230,7 @@ def test_current_price_lists_unchanged(mods, tmp_path):
 # then 02:00 CET. Each entry carries its offset, so the second is its own hour.
 
 UTC = timezone.utc
-DST_NOW = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)  # 02:30 CET, the repeated hour's second pass
+DST_NOW = datetime(2026, 10, 25, 2, 30, fold=1, tzinfo=TZ)  # 02:30 CET (01:30Z), the repeated hour's second pass
 
 
 def _dst_frames(first=datetime(2026, 10, 24, 22, tzinfo=UTC), count=49):
@@ -352,18 +352,40 @@ def test_legacy_cache_gets_its_offsets_on_load(mods, tmp_path, dst_clock):
     assert all("+0" in p["start"] for p in price_sensor.extra_state_attributes["Best prices"])
 
 
-def test_legacy_cache_with_a_lone_repeated_hour_is_not_used(mods, tmp_path, dst_clock):
-    """The old fetch skipped a null-priced frame, so a legacy cache may hold only one 02:00: unusable."""
-    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+def _legacy_lone_twin(coordinator):
+    """A cache in the old format whose 02:00 CEST was never cached (price null): the CET row is alone."""
     legacy = copy.deepcopy(coordinator.data)
-    for entry in legacy["prices"] + legacy["prices_today"]:
-        entry["start"] = entry["start"][:19]
-    del legacy["prices"][2], legacy["prices_today"][2]  # 02:00 CEST never cached; the CET row is alone
+    for key in ("prices", "prices_today"):
+        legacy[key] = [{**e, "start": e["start"][:19]} for e in legacy[key] if e["start"] != "2026-10-25T02:00:00+02:00"]
     legacy["last_updated"] = "2026-10-25T00:01:00"
     Path(coordinator._cache_file).write_text(json.dumps(legacy))
     coordinator.data = None
-    assert not asyncio.run(coordinator.async_load_startup_cache())  # fetch instead
+
+
+def test_legacy_cache_with_a_lone_repeated_hour_drops_it(mods, tmp_path, dst_clock):
+    """Which pass the lone row was is lost: it goes, and at 02:30 CET the hour has no row, so start-up fetches."""
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    _legacy_lone_twin(coordinator)
+    assert not asyncio.run(coordinator.async_load_startup_cache())
     assert coordinator.data is None and sensor.native_value is None
+    loaded = asyncio.run(coordinator._load_own_cache())
+    assert "2026-10-25T02:00:00+01:00" not in [p["start"] for p in loaded["prices"]]
+    assert "2026-10-25T02:00:00+02:00" not in [p["start"] for p in loaded["prices"]]
+    assert len(loaded["prices"]) == 47
+
+
+def test_legacy_lone_twin_of_yesterday_keeps_today(mods, tmp_path):
+    """The next morning, yesterday's lone row costs nothing: today's 24 rows load without a request."""
+    CLOCK[0] = datetime(2026, 10, 26, 8, 30, tzinfo=TZ)
+    try:
+        coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+        _legacy_lone_twin(coordinator)
+        assert asyncio.run(coordinator.async_load_startup_cache())
+        assert len(coordinator.data["prices_today"]) == 24
+        assert coordinator.data["prices_today"][8]["start"] == "2026-10-26T08:00:00+01:00"
+        assert sensor.native_value == coordinator.data["prices_today"][8]["price"]
+    finally:
+        CLOCK[0] = NOW
 
 
 def test_legacy_cache_of_an_ordinary_day_loads_with_offsets(mods, tmp_path):

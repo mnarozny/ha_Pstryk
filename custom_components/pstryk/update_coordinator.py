@@ -70,8 +70,8 @@ def with_offsets(data):
     The API lists frames in order and the cache keeps that order, so of two
     equal naive starts the second is the second pass (fold=1): 02:00+01:00.
     One without its twin (the other hour's price was null and never cached)
-    has lost which pass it was: None, so the cache is not used and the prices
-    are fetched.
+    has lost which pass it was and is dropped; the rest of the cache stands,
+    and `today_usable()` decides whether the day still needs a fetch.
     """
     if not data:
         return data
@@ -96,9 +96,9 @@ def with_offsets(data):
             first = dt_util.as_local(parsed.replace(fold=0))
             second = dt_util.as_local(parsed.replace(fold=1))
             if first.utcoffset() != second.utcoffset() and naive[start] != 2:
-                _LOGGER.info("Cache holds the repeated hour %s without its twin; which pass it was is lost, so the cache is not used",
+                _LOGGER.info("Cache holds the repeated hour %s without its twin; which pass it was is lost, so the row is dropped",
                              start)
-                return None
+                continue
             rewritten.append({**entry, "start": (second if start in seen else first).isoformat()})
             seen.add(start)
         out[key] = rewritten
