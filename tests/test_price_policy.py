@@ -1,6 +1,6 @@
 """Tests for price_policy.py, loaded by path so Home Assistant is not needed."""
 import importlib.util
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,6 +46,31 @@ def test_today_published(entries, now, expected):
     assert price_policy.today_published(entries, now) is expected
 
 
+def _dst_day(drop=None):
+    """2026-10-25 with its offsets: 00:00, 01:00, 02:00 CEST, then 02:00 CET to 23:00; `drop` leaves one out."""
+    entries = [{"start": f"2026-10-25T{h:02d}:00:00+02:00", "price": 1.0, "tge_price": 0.5} for h in range(3)]
+    entries += [{"start": f"2026-10-25T{h:02d}:00:00+01:00", "price": 1.0, "tge_price": 0.5} for h in range(2, 24)]
+    return [e for e in entries if e["start"] != drop]
+
+
+CEST_0230 = datetime(2026, 10, 25, 2, 30, tzinfo=WARSAW)
+CET_0230 = datetime(2026, 10, 25, 2, 30, fold=1, tzinfo=WARSAW)
+
+
+@pytest.mark.parametrize(
+    "entries, now, expected",
+    [
+        (_dst_day(), CEST_0230, True),
+        (_dst_day(), CET_0230, True),
+        (_dst_day(drop="2026-10-25T02:00:00+01:00"), CET_0230, False),  # the other pass would pass by prefix
+        (_dst_day(drop="2026-10-25T02:00:00+02:00"), CEST_0230, False),
+        (_dst_day(drop="2026-10-25T02:00:00+02:00"), CET_0230, True),
+    ],
+)
+def test_today_published_in_the_repeated_hour(entries, now, expected):
+    assert price_policy.today_published(entries, now) is expected
+
+
 @pytest.mark.parametrize(
     "has_tomorrow, now, expected",
     [
@@ -70,6 +95,21 @@ def test_tomorrow_fetch_due(has_tomorrow, now, expected):
 )
 def test_next_cost_run(now, expected):
     assert price_policy.next_cost_run(now) == expected
+
+
+@pytest.mark.parametrize(
+    "now, expected_utc",
+    [
+        (CEST_0230, datetime(2026, 10, 25, 0, 50, tzinfo=timezone.utc)),  # 02:50 CEST
+        (_local(2026, 10, 25, 2, 50), datetime(2026, 10, 25, 1, 50, tzinfo=timezone.utc)),  # 02:50 CET, the repeated hour
+        (CET_0230, datetime(2026, 10, 25, 1, 50, tzinfo=timezone.utc)),
+        (_local(2027, 3, 28, 1, 50), datetime(2027, 3, 28, 1, 50, tzinfo=timezone.utc)),  # 03:50 CEST, no 02:50
+    ],
+)
+def test_next_cost_run_at_the_clock_changes(now, expected_utc):
+    run = price_policy.next_cost_run(now)
+    assert run.astimezone(timezone.utc) == expected_utc
+    assert run.tzinfo is WARSAW
 
 
 def test_cost_waits_for_tomorrows_prices():
