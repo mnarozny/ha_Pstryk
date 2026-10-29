@@ -350,3 +350,30 @@ def test_legacy_cache_gets_its_offsets_on_load(mods, tmp_path, dst_clock):
     price_sensor = _price_sensor(mods, coordinator)
     assert price_sensor.native_value == prices[3]["price"]
     assert all("+0" in p["start"] for p in price_sensor.extra_state_attributes["Best prices"])
+
+
+def test_legacy_cache_with_a_lone_repeated_hour_is_not_used(mods, tmp_path, dst_clock):
+    """The old fetch skipped a null-priced frame, so a legacy cache may hold only one 02:00: unusable."""
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    legacy = copy.deepcopy(coordinator.data)
+    for entry in legacy["prices"] + legacy["prices_today"]:
+        entry["start"] = entry["start"][:19]
+    del legacy["prices"][2], legacy["prices_today"][2]  # 02:00 CEST never cached; the CET row is alone
+    legacy["last_updated"] = "2026-10-25T00:01:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+    assert not asyncio.run(coordinator.async_load_startup_cache())  # fetch instead
+    assert coordinator.data is None and sensor.native_value is None
+
+
+def test_legacy_cache_of_an_ordinary_day_loads_with_offsets(mods, tmp_path):
+    coordinator, sensor = _fetch(mods, tmp_path, REAL, "buy")
+    legacy = copy.deepcopy(coordinator.data)
+    for entry in legacy["prices"] + legacy["prices_today"]:
+        entry["start"] = entry["start"][:19]
+    legacy["last_updated"] = "2026-10-02T12:06:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+    assert asyncio.run(coordinator.async_load_startup_cache())
+    assert coordinator.data["prices"][13]["start"] == "2026-10-02T13:00:00+02:00"
+    assert sensor.native_value == coordinator.data["prices"][13]["price"]

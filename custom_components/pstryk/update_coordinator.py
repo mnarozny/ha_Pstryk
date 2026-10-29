@@ -67,8 +67,11 @@ def with_offsets(data):
     """`data` with every naive `start` (a cache written before 2.1.4.4) given its offset.
 
     A naive local time is ambiguous in the repeated hour of a clock change.
-    The API lists frames in order and the cache keeps that order, so the second
-    of two equal naive starts is the second pass (fold=1): 02:00+01:00.
+    The API lists frames in order and the cache keeps that order, so of two
+    equal naive starts the second is the second pass (fold=1): 02:00+01:00.
+    One without its twin (the other hour's price was null and never cached)
+    has lost which pass it was: None, so the cache is not used and the prices
+    are fetched.
     """
     if not data:
         return data
@@ -77,17 +80,27 @@ def with_offsets(data):
         entries = data.get(key)
         if not entries:
             continue
+        naive = {}
+        for entry in entries:
+            parsed = dt_util.parse_datetime(entry.get("start") or "")
+            if parsed is not None and parsed.tzinfo is None:
+                naive[entry["start"]] = naive.get(entry["start"], 0) + 1
         seen = set()
         rewritten = []
         for entry in entries:
             start = entry.get("start")
-            parsed = dt_util.parse_datetime(start) if start else None
-            if parsed is None or parsed.tzinfo is not None:
+            if start not in naive:
                 rewritten.append(entry)
                 continue
-            parsed = parsed.replace(fold=1 if start in seen else 0)
+            parsed = dt_util.parse_datetime(start)
+            first = dt_util.as_local(parsed.replace(fold=0))
+            second = dt_util.as_local(parsed.replace(fold=1))
+            if first.utcoffset() != second.utcoffset() and naive[start] != 2:
+                _LOGGER.info("Cache holds the repeated hour %s without its twin; which pass it was is lost, so the cache is not used",
+                             start)
+                return None
+            rewritten.append({**entry, "start": (second if start in seen else first).isoformat()})
             seen.add(start)
-            rewritten.append({**entry, "start": dt_util.as_local(parsed).isoformat()})
         out[key] = rewritten
     return out
 
