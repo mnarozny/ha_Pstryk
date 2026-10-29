@@ -2,7 +2,7 @@
 
 Pure functions with no Home Assistant imports. Times are local (Europe/Warsaw).
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Pstryk publishes tomorrow's prices shortly after 12:00 (seen 2026-10-01 to
 # 10-04; on 10-04 the API still had none at 12:00:04).
@@ -30,14 +30,30 @@ def today_published(entries: list[dict], now: datetime) -> bool:
     the key and count as published (the caller also applies the placeholder check).
     """
     day = now.strftime("%Y-%m-%d")
-    hour = now.strftime("%Y-%m-%dT%H")
     published = [
         p for p in entries
         if p.get("start", "").startswith(day)
         and p.get("price") is not None
         and ("tge_price" not in p or p["tge_price"] is not None)
     ]
-    return len(published) >= 20 and any(p["start"].startswith(hour) for p in published)
+    return len(published) >= 20 and any(covers(p["start"], now) for p in published)
+
+
+def covers(start: str, now: datetime) -> bool:
+    """Whether the entry starting at `start` is the hour `now` is in.
+
+    By instant when `start` carries its offset: in the repeated hour of a
+    clock change, 02:00+02:00 and 02:00+01:00 share a prefix and either would
+    pass for the other. A naive start (a cache from before 2.1.4.4) is matched
+    by its hour's prefix.
+    """
+    try:
+        begins = datetime.fromisoformat(start)
+    except ValueError:
+        return False
+    if begins.tzinfo is None:
+        return start.startswith(now.strftime("%Y-%m-%dT%H"))
+    return begins <= now < begins + timedelta(hours=1)
 
 
 def tomorrow_fetch_due(has_tomorrow: bool, now: datetime) -> bool:
@@ -63,11 +79,16 @@ def next_tomorrow_check(now: datetime) -> datetime:
 
 
 def next_cost_run(now: datetime) -> datetime:
-    """The next :50 strictly after `now`."""
-    run = now.replace(minute=COST_RUN_MINUTE, second=0, microsecond=0)
-    if run <= now:
-        run = (now + timedelta(hours=1)).replace(minute=COST_RUN_MINUTE, second=0, microsecond=0)
-    return run
+    """The next :50 strictly after `now`, in `now`'s zone.
+
+    Stepped in UTC: on the local wall clock 02:50 CEST + 1 h is 03:50 CET and
+    the repeated hour's run is skipped. Poland's offsets are whole hours.
+    """
+    utc = now.astimezone(timezone.utc)
+    run = utc.replace(minute=COST_RUN_MINUTE, second=0, microsecond=0)
+    if run <= utc:
+        run += timedelta(hours=1)
+    return run.astimezone(now.tzinfo)
 
 
 def cost_run_allowed(now: datetime, has_tomorrow: bool) -> bool:

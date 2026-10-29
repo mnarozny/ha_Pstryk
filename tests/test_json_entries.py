@@ -11,7 +11,7 @@ import importlib
 import json
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -66,6 +66,7 @@ def _stubs():
         as_utc=lambda d: d.astimezone(timezone.utc),
         as_local=_as_local,
         parse_datetime=_parse_datetime,
+        start_of_local_day=lambda d: datetime(d.year, d.month, d.day, tzinfo=TZ),
         DEFAULT_TIME_ZONE=TZ,
     )
     aiohttp = _stub("aiohttp")
@@ -122,6 +123,7 @@ def mods():
             uc=importlib.import_module("pstryk.update_coordinator"),
             sensor=importlib.import_module("pstryk.sensor"),
             pc=importlib.import_module("pstryk.price_components"),
+            mqtt=importlib.import_module("pstryk.mqtt_publisher"),
         )
     finally:
         for name in [n for n in sys.modules if n == "pstryk" or n.startswith("pstryk.")]:
@@ -222,3 +224,178 @@ def test_current_price_lists_unchanged(mods, tmp_path):
     attrs = price_sensor.extra_state_attributes
     for key in ("All prices", "Best prices", "Worst prices"):
         assert all(set(p) == {"start", "price"} for p in attrs[key])
+
+
+# The night the clocks go back: 2026-10-25 has 25 local hours, 02:00 CEST and
+# then 02:00 CET. Each entry carries its offset, so the second is its own hour.
+
+UTC = timezone.utc
+DST_NOW = datetime(2026, 10, 25, 2, 30, fold=1, tzinfo=TZ)  # 02:30 CET (01:30Z), the repeated hour's second pass
+
+
+def _dst_frames(first=datetime(2026, 10, 24, 22, tzinfo=UTC), count=49):
+    """Frames as the API sends them, a distinct price per hour: by default 2026-10-25 (25 local hours) and 10-26."""
+    frames = []
+    for i in range(count):
+        start = first + timedelta(hours=i)
+        tge = round(0.3 + i / 100, 2)
+        frames.append({
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": (start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "metrics": {"pricing": {
+                "tge_price": tge, "dist_price": 0.1348, "service_price": 0.08,
+                "vat_component": 0.1, "excise_component": 0.005,
+                "price_gross": round(tge + 0.5, 2), "price_prosumer_gross": round(tge * 1.23, 2),
+                "is_cheap": False, "is_expensive": False,
+            }},
+        })
+    return {"frames": frames}
+
+
+@pytest.fixture
+def dst_clock():
+    CLOCK[0] = DST_NOW
+    yield
+    CLOCK[0] = NOW
+
+
+def _price_sensor(mods, coordinator):
+    sensor = mods.sensor.PstrykPriceSensor(coordinator, "buy", 5, 5, "entry")
+    sensor.hass = types.SimpleNamespace(states=types.SimpleNamespace(get=lambda _: None))
+    return sensor
+
+
+def test_repeated_hour_keeps_both_entries(mods, tmp_path, dst_clock):
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    assert [p["start"] for p in prices[2:5]] == [
+        "2026-10-25T02:00:00+02:00", "2026-10-25T02:00:00+01:00", "2026-10-25T03:00:00+01:00",
+    ]
+    assert len(coordinator.data["prices_today"]) == 25
+    today = sensor.extra_state_attributes["prices_today"]
+    times = [e["time"] for e in today]
+    assert len(times) == 25 and len(set(times)) == 25
+    assert times[3] == datetime(2026, 10, 25, 1, tzinfo=UTC)
+    # 02:30 CET is the second pass: its own price, not 02:00 CEST's.
+    assert sensor.native_value == prices[3]["price"] != prices[2]["price"]
+
+
+def test_repeated_hour_in_the_price_sensor(mods, tmp_path, dst_clock):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    sensor = _price_sensor(mods, coordinator)
+    assert sensor.native_value == prices[3]["price"]
+    attrs = sensor.extra_state_attributes
+    assert attrs["Price count"] == 25
+    # 02:00 CET and the 22 hours after it remain; 02:00 CEST is over.
+    assert attrs["Average price today /22"] == round(sum(p["price"] for p in prices[3:25]) / 22, 2)
+
+
+def test_consecutive_values_follow_the_instant_order(mods, tmp_path):
+    coordinator, _ = _fetch(mods, tmp_path, REAL, "buy")
+    sensor = _price_sensor(mods, coordinator)
+    entries = [
+        {"start": "2026-10-25T01:00:00+02:00", "price": 0.5},
+        {"start": "2026-10-25T02:00:00+02:00", "price": 0.4},
+        {"start": "2026-10-25T02:00:00+01:00", "price": 0.5},
+    ]
+    # Sorted as strings, 02:00+01:00 would sit next to 01:00 and count as a pair.
+    assert sensor._count_consecutive_same_values(entries) == 1
+
+
+def test_mqtt_list_keeps_the_repeated_hour_in_order(mods, tmp_path, dst_clock, caplog):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    publisher = mods.mqtt.PstrykMqttPublisher(types.SimpleNamespace(data={"pstryk": {}}), "entry")
+    with caplog.at_level("WARNING"):
+        formatted = publisher._format_prices_for_evcc(coordinator.data, "buy")
+    starts = [f["start"] for f in formatted]
+    assert len(starts) == 25 and starts == sorted(starts)
+    assert starts[2:5] == ["2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z", "2026-10-25T02:00:00Z"]
+    assert "Incomplete day" not in caplog.text
+
+
+def test_next_hour_price_at_both_clock_changes(mods, tmp_path):
+    coordinator, _ = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    prices = coordinator.data["prices"]
+    sensor = _price_sensor(mods, coordinator)
+    CLOCK[0] = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)  # 02:30 CEST: next is 02:00 CET, not 03:00
+    assert sensor._get_next_hour_price() == prices[3]["price"]
+    CLOCK[0] = DST_NOW  # 02:30 CET: next is 03:00 CET
+    assert sensor._get_next_hour_price() == prices[4]["price"]
+    # Spring forward, 2027-03-28: 02:00 CET does not exist; after 01:30 CET comes 03:00 CEST.
+    spring, _ = _fetch(mods, tmp_path, _dst_frames(datetime(2027, 3, 27, 23, tzinfo=UTC), 23), "buy")
+    CLOCK[0] = datetime(2027, 3, 28, 0, 30, tzinfo=UTC)
+    sensor = _price_sensor(mods, spring)
+    assert spring.data["prices"][2]["start"] == "2027-03-28T03:00:00+02:00"
+    assert sensor._get_next_hour_price() == spring.data["prices"][2]["price"]
+    CLOCK[0] = NOW
+
+
+def test_legacy_cache_gets_its_offsets_on_load(mods, tmp_path, dst_clock):
+    """A cache written before 2.1.4.4 (naive starts, the 02:00 twice) is read as 25 distinct hours."""
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    legacy = copy.deepcopy(coordinator.data)
+    for entry in legacy["prices"] + legacy["prices_today"]:
+        entry["start"] = entry["start"][:19]
+    legacy["last_updated"] = "2026-10-25T00:01:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+    assert asyncio.run(coordinator.async_load_startup_cache())  # today's prices: no request
+    prices = coordinator.data["prices"]
+    assert [p["start"] for p in prices[2:5]] == [
+        "2026-10-25T02:00:00+02:00", "2026-10-25T02:00:00+01:00", "2026-10-25T03:00:00+01:00",
+    ]
+    assert prices[3]["price"] != prices[2]["price"]
+    assert sensor.native_value == prices[3]["price"]
+    price_sensor = _price_sensor(mods, coordinator)
+    assert price_sensor.native_value == prices[3]["price"]
+    assert all("+0" in p["start"] for p in price_sensor.extra_state_attributes["Best prices"])
+
+
+def _legacy_lone_twin(coordinator):
+    """A cache in the old format whose 02:00 CEST was never cached (price null): the CET row is alone."""
+    legacy = copy.deepcopy(coordinator.data)
+    for key in ("prices", "prices_today"):
+        legacy[key] = [{**e, "start": e["start"][:19]} for e in legacy[key] if e["start"] != "2026-10-25T02:00:00+02:00"]
+    legacy["last_updated"] = "2026-10-25T00:01:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+
+
+def test_legacy_cache_with_a_lone_repeated_hour_drops_it(mods, tmp_path, dst_clock):
+    """Which pass the lone row was is lost: it goes, and at 02:30 CET the hour has no row, so start-up fetches."""
+    coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+    _legacy_lone_twin(coordinator)
+    assert not asyncio.run(coordinator.async_load_startup_cache())
+    assert coordinator.data is None and sensor.native_value is None
+    loaded = asyncio.run(coordinator._load_own_cache())
+    assert "2026-10-25T02:00:00+01:00" not in [p["start"] for p in loaded["prices"]]
+    assert "2026-10-25T02:00:00+02:00" not in [p["start"] for p in loaded["prices"]]
+    assert len(loaded["prices"]) == 47
+
+
+def test_legacy_lone_twin_of_yesterday_keeps_today(mods, tmp_path):
+    """The next morning, yesterday's lone row costs nothing: today's 24 rows load without a request."""
+    CLOCK[0] = datetime(2026, 10, 26, 8, 30, tzinfo=TZ)
+    try:
+        coordinator, sensor = _fetch(mods, tmp_path, _dst_frames(), "buy")
+        _legacy_lone_twin(coordinator)
+        assert asyncio.run(coordinator.async_load_startup_cache())
+        assert len(coordinator.data["prices_today"]) == 24
+        assert coordinator.data["prices_today"][8]["start"] == "2026-10-26T08:00:00+01:00"
+        assert sensor.native_value == coordinator.data["prices_today"][8]["price"]
+    finally:
+        CLOCK[0] = NOW
+
+
+def test_legacy_cache_of_an_ordinary_day_loads_with_offsets(mods, tmp_path):
+    coordinator, sensor = _fetch(mods, tmp_path, REAL, "buy")
+    legacy = copy.deepcopy(coordinator.data)
+    for entry in legacy["prices"] + legacy["prices_today"]:
+        entry["start"] = entry["start"][:19]
+    legacy["last_updated"] = "2026-10-02T12:06:00"
+    Path(coordinator._cache_file).write_text(json.dumps(legacy))
+    coordinator.data = None
+    assert asyncio.run(coordinator.async_load_startup_cache())
+    assert coordinator.data["prices"][13]["start"] == "2026-10-02T13:00:00+02:00"
+    assert sensor.native_value == coordinator.data["prices"][13]["price"]

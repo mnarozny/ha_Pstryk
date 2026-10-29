@@ -1120,3 +1120,76 @@ def test_review5_a_restart_restores_the_send_time(mods, env):
         assert sent[2] == datetime(2026, 10, 4, 12, 50, 3, 100000, tzinfo=TZ)
         assert sent[5] - sent[2] >= timedelta(hours=1, seconds=2)
         assert env.hass.session.max_in_any_hour() == 3
+
+
+def test_hourly_tick_covers_the_repeated_hour(mods, env):
+    """2026-10-25: 02:00 CEST (00:00Z) and 02:00 CET (01:00Z) each get their tick.
+
+    Computed on the local wall clock, 02:10 CEST + 1 h was 03:00 CET (02:00Z),
+    and the repeated hour had no tick. From kriskomp/ha_Pstryk 2.2.4.
+    """
+    client, coords = _run(env.build())
+    buy = coords["buy"]
+    _set_clock(2026, 10, 25, 2, 10)  # 02:10 CEST, the first pass
+    buy.schedule_hourly_update()
+    assert SCHEDULED[-1][0].astimezone(timezone.utc) == datetime(2026, 10, 25, 1, 0, 5, tzinfo=timezone.utc)
+    CLOCK[0] = datetime(2026, 10, 25, 2, 10, fold=1, tzinfo=TZ)  # 02:10 CET, the second pass
+    buy.schedule_hourly_update()
+    assert SCHEDULED[-1][0].astimezone(timezone.utc) == datetime(2026, 10, 25, 2, 0, 5, tzinfo=timezone.utc)
+
+
+def _dst_frames():
+    """49 frames as the API sends them: 2026-10-25 (25 local hours) and 10-26, a distinct price per hour."""
+    first = datetime(2026, 10, 24, 22, tzinfo=timezone.utc)
+    frames = []
+    for i in range(49):
+        start = first + timedelta(hours=i)
+        tge = round(0.3 + i / 100, 2)
+        frames.append({
+            "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": (start + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "metrics": {"pricing": {
+                "tge_price": tge, "dist_price": 0.1348, "service_price": 0.08,
+                "vat_component": 0.1, "excise_component": 0.005,
+                "price_gross": round(tge + 0.5, 2), "price_prosumer_gross": round(tge * 1.23, 2),
+                "is_cheap": False, "is_expensive": False,
+            }},
+        })
+    return {"frames": frames}
+
+
+def test_hour_tick_fetches_when_the_cache_lacks_the_current_hour(mods, env):
+    """Upgraded at 01:30 on the clock-change day with an old cache whose 02:00 CEST was never cached:
+    the lone 02:00 CET row is dropped, start-up accepts the rest, and the 02:00 tick fetches."""
+    env.hass.session.pricing = _dst_frames()
+
+    async def scenario():
+        _at(25, 0, 1)
+        client, coords = await env.build()
+        await coords["buy"].async_request_refresh()
+        legacy = CACHE["buy"]
+        for key in ("prices", "prices_today"):
+            legacy[key] = [{**e, "start": e["start"][:19]} for e in legacy[key]
+                           if e["start"] != "2026-10-25T02:00:00+02:00"]
+        legacy["last_updated"] = "2026-10-25T00:01:00"
+        env.hass.data["pstryk"].clear()
+        _at(25, 1, 30)
+        client, coords = await env.build()
+        buy = coords["buy"]
+        buy.schedule_hourly_update = lambda: None
+        await buy.async_startup()
+        at_startup = len(env.hass.session.sent)
+        assert "2026-10-25T02:00:00+01:00" not in [p["start"] for p in buy.data["prices"]]
+        _at(25, 2, 0, 5)  # 02:00:05 CEST: no price for this hour in the cache
+        await buy._handle_hourly_update(None)
+        at_first_tick = len(env.hass.session.sent)
+        CLOCK[0] = datetime(2026, 10, 25, 2, 0, 5, fold=1, tzinfo=TZ)  # 02:00:05 CET: fetched, covered
+        await buy._handle_hourly_update(None)
+        return at_startup, at_first_tick, len(env.hass.session.sent), buy
+
+    sent0, sent1, sent2, buy = _run(scenario())
+    assert sent0 == 1  # the first refresh only; start-up took the cache
+    assert sent1 == 2  # the tick fetched
+    assert sent2 == 2
+    starts = [p["start"] for p in buy.data["prices"]]
+    assert "2026-10-25T02:00:00+02:00" in starts and "2026-10-25T02:00:00+01:00" in starts
