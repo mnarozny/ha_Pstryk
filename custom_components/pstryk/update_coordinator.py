@@ -467,16 +467,17 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
 
         if cached_data:
             last_updated = cached_data.get("last_updated", "")
-            if last_updated:
+            # A fetch from yesterday afternoon already holds today's prices. A
+            # cache from today can still lack the current hour (a repeated hour
+            # dropped from an older version's cache): then fetch, whatever the
+            # cache's date; only an old cache is marked invalid.
+            if last_updated and not self.today_usable(cached_data):
                 try:
                     cache_date = last_updated.split("T")[0]
                     today_date = dt_util.now().strftime("%Y-%m-%d")
-
-                    # A fetch from yesterday afternoon already holds today's prices.
-                    if cache_date != today_date and not self.today_usable(cached_data):
+                    if cache_date != today_date:
                         _LOGGER.error("Cache for %s is from %s (today is %s) - OLD DATA! Marking as invalid.",
                                      self.price_type, cache_date, today_date)
-
                         try:
                             invalid_cache = {
                                 "invalid": True,
@@ -489,19 +490,21 @@ class PstrykDataUpdateCoordinator(DataUpdateCoordinator):
                             _LOGGER.warning("Marked old cache as INVALID for %s", self.price_type)
                         except Exception as cache_err:
                             _LOGGER.error("Failed to mark cache as invalid: %s", cache_err)
-
-                        try:
-                            await self.async_request_refresh()
-                        except Exception as fetch_err:
-                            _LOGGER.error("Failed to fetch fresh data for %s: %s - sensors UNAVAILABLE",
-                                        self.price_type, fetch_err)
-                            self.data = None
-                            self.async_update_listeners()
-
-                        self.schedule_hourly_update()
-                        return
+                    else:
+                        _LOGGER.info("Cache for %s has no price for the current hour; fetching", self.price_type)
                 except Exception as err:
                     _LOGGER.debug("Could not parse cache date: %s", err)
+
+                try:
+                    await self.async_request_refresh()
+                except Exception as fetch_err:
+                    _LOGGER.error("Failed to fetch fresh data for %s: %s - sensors UNAVAILABLE",
+                                self.price_type, fetch_err)
+                    self.data = None
+                    self.async_update_listeners()
+
+                self.schedule_hourly_update()
+                return
 
             cached_data["is_cached"] = True
             self.data = self._for_today(cached_data)
